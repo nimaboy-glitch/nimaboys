@@ -1,5 +1,7 @@
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import date, timedelta
+import csv
+import io
 import math
 import random
 import re
@@ -55,6 +57,13 @@ KNOWN_DATE_COLUMNS = ["date", "trans. date", "trans_date", "transaction date"]
 KNOWN_REMARK_COLUMNS = [
     "remarks", "remark", "details", "description", "narration"
 ]
+KNOWN_DEBIT_COLUMNS = ["debits", "debit", "withdrawals", "withdrawal"]
+KNOWN_CREDIT_COLUMNS = ["credits", "credit", "deposits", "deposit"]
+
+# Rows starting with these words are footers/summaries, not transactions.
+NON_TRANSACTION_PREFIXES = (
+    "total", "uncleared", "opening", "closing", "balance"
+)
 
 
 # --------------------------- Money helpers -------------------------------
@@ -354,13 +363,114 @@ def generate_items(
 
 # ----------------------- Known (uploaded) rows ---------------------------
 
+def read_known_csv(uploaded_file) -> pd.DataFrame:
+    """
+    Read an uploaded CSV as text. Title lines above the column headings
+    (e.g. a project header) are skipped: the heading row is the first row
+    that has an 'amount' column or a debit/credit column. Comma, semicolon
+    and tab separated files are all accepted.
+    """
+    data = uploaded_file.getvalue()
+    if isinstance(data, bytes):
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = data.decode("latin-1")
+    else:
+        text = str(data)
+
+    wanted = {"amount"} | set(KNOWN_DEBIT_COLUMNS) | set(KNOWN_CREDIT_COLUMNS)
+
+    for delimiter in (",", ";", "\t"):
+        rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+        for index, row in enumerate(rows):
+            header = [cell.strip() for cell in row]
+            if not wanted & {cell.lower() for cell in header}:
+                continue
+
+            width = len(header)
+            body = []
+            for line in rows[index + 1:]:
+                cells = [cell.strip() for cell in line]
+                if not any(cells):
+                    continue  # blank line
+                cells = (cells + [""] * width)[:width]
+                body.append(cells)
+            return pd.DataFrame(body, columns=header, dtype=str)
+
+    raise ValueError(
+        "No column headings found. The CSV needs an 'amount' column, "
+        "or 'Debits' and 'Credits' columns."
+    )
+
+
+def side_cents(value) -> int:
+    """Read a debit or credit cell as positive cents; blank cells are 0."""
+    if value is None or pd.isna(value):
+        return 0
+    text = str(value).strip()
+    if text in ("", "-", "nan"):
+        return 0
+    return abs(to_cents(text))
+
+
 def prepare_known_frame(raw: pd.DataFrame) -> pd.DataFrame:
-    """Validate an uploaded CSV and return it with tidy column names."""
+    """
+    Validate an uploaded CSV and return it with tidy column names.
+
+    Two layouts are accepted:
+      * a signed 'amount' column (credits positive, debits negative), or
+      * statement style 'Debits' / 'Credits' columns, which are turned
+        into a signed 'amount' column. Footer rows (TOTAL, Total
+        Transactions, Uncleared Amount ...) and rows with no debit or
+        credit are left out.
+    """
     frame = raw.copy()
     frame.columns = [str(c).strip().lower() for c in frame.columns]
 
     if "amount" not in frame.columns:
-        raise ValueError("The CSV must contain an 'amount' column.")
+        debit_column = next(
+            (c for c in KNOWN_DEBIT_COLUMNS if c in frame.columns), None
+        )
+        credit_column = next(
+            (c for c in KNOWN_CREDIT_COLUMNS if c in frame.columns), None
+        )
+        if debit_column is None and credit_column is None:
+            raise ValueError(
+                "The CSV must contain an 'amount' column, or 'Debits' "
+                "and 'Credits' columns."
+            )
+
+        first_column = frame.columns[0]
+        keep, amounts = [], []
+        for position, (label, row) in enumerate(frame.iterrows(), start=1):
+            first_cell = str(row[first_column]).strip().lower()
+            if first_cell.startswith(NON_TRANSACTION_PREFIXES):
+                continue  # footer / summary row
+
+            try:
+                debit = side_cents(row[debit_column]) if debit_column else 0
+                credit = (
+                    side_cents(row[credit_column]) if credit_column else 0
+                )
+            except ValueError:
+                raise ValueError(
+                    f"Row {position} has an invalid debit or credit."
+                )
+
+            if debit == 0 and credit == 0:
+                continue  # nothing moved on this row
+
+            net = credit - debit
+            sign = "-" if net < 0 else ""
+            keep.append(label)
+            amounts.append(f"{sign}{Decimal(abs(net)) / Decimal(100):.2f}")
+
+        frame = frame.loc[keep].reset_index(drop=True)
+        frame["amount"] = amounts
+
+        if frame.empty:
+            raise ValueError("No transactions were found in the CSV.")
 
     for position, value in enumerate(frame["amount"], start=1):
         if pd.isna(value) or str(value).strip() == "":
@@ -676,7 +786,9 @@ uploaded_file = st.file_uploader(
     "Optional known-transactions CSV",
     type=["csv"],
     help=(
-        "Needs an 'amount' column. Optional columns: 'date' (any common "
+        "Needs an 'amount' column, or 'Debits' and 'Credits' columns "
+        "(a downloaded statement_entries.csv works as it is). "
+        "Optional columns: 'date' (any common "
         "format, e.g. 2026-02-14 or 14-Feb-2026) and 'remarks', 'details', "
         "'description' or 'narration'. Rows without a date are placed on "
         "the gap start date."
@@ -688,9 +800,7 @@ known_net_cents = 0
 
 if uploaded_file is not None:
     try:
-        known_frame = prepare_known_frame(
-            pd.read_csv(uploaded_file, dtype=str)
-        )
+        known_frame = prepare_known_frame(read_known_csv(uploaded_file))
         known_net_cents = known_net(known_frame)
 
         st.success(
