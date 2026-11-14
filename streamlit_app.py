@@ -52,6 +52,8 @@ CREDIT_REMARKS = [
 
 ESTIMATED_TAG = "(ESTIMATED / NOT BANK-SOURCED)"
 KNOWN_DEFAULT_REMARK = "KNOWN TRANSACTION (UPLOADED)"
+SALARY_REMARK = "SAMPLE SALARY ENTRY"
+SALARY_DATE_RETRIES = 100   # tries at keeping the balance above zero
 
 KNOWN_DATE_COLUMNS = ["date", "trans. date", "trans_date", "transaction date"]
 KNOWN_REMARK_COLUMNS = [
@@ -545,34 +547,74 @@ def known_items_from_frame(frame: pd.DataFrame, default_date: date) -> list:
     return items
 
 
+# ------------------------------ Salary -----------------------------------
+
+def salary_dates(start_date: date, end_date: date) -> list:
+    """Every 1st of a month from start_date to end_date (both included)."""
+    year, month = start_date.year, start_date.month
+    if start_date.day > 1:
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+
+    dates = []
+    while date(year, month, 1) <= end_date:
+        dates.append(date(year, month, 1))
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return dates
+
+
+def salary_items(amount_cents: int, start_date: date, end_date: date) -> list:
+    """
+    One salary credit of `amount_cents` on the 1st of every month inside
+    the gap dates. Salary is money coming IN, so it is a credit.
+    """
+    if amount_cents <= 0:
+        return []
+    return [
+        {
+            "date": pay_day,
+            "amount": amount_cents,
+            "remark": SALARY_REMARK,
+            "source": "salary",
+        }
+        for pay_day in salary_dates(start_date, end_date)
+    ]
+
+
 # ------------------------- Statement building ----------------------------
 
+SOURCE_ORDER = {"known": 0, "salary": 1, "generated": 2}
+
+
 def sort_items(items: list) -> list:
-    """Sort by date; on the same date known rows come before estimates."""
+    """
+    Sort by date; on the same date known rows come first, then salary,
+    then estimates.
+    """
     return sorted(
         items,
-        key=lambda i: (i["date"], 0 if i["source"] == "known" else 1),
+        key=lambda i: (i["date"], SOURCE_ORDER[i["source"]]),
     )
 
 
 def finalize_items(
-    opening_cents: int, known: list, generated: list, seed: int
+    opening_cents: int, fixed: list, generated: list, seed: int
 ) -> list:
     """
-    Combine known and estimated entries in date order. The estimated
-    amounts are re-ordered across their dates so the balance stays at or
-    above zero whenever possible (like a real account). Totals and dates
-    do not change, only which amount lands on which date.
+    Combine fixed entries (known and salary rows) and estimated entries in
+    date order. The estimated amounts are re-ordered across their dates so
+    the balance stays at or above zero whenever possible (like a real
+    account). Totals and dates do not change, only which amount lands on
+    which date. Fixed entries are never moved or changed.
     """
     rng = random.Random(seed + 1)
-    items = [dict(i) for i in sort_items(known + generated)]
+    items = [dict(i) for i in sort_items(fixed + generated)]
 
     pool = [(i["amount"], i["remark"]) for i in items
             if i["source"] == "generated"]
 
     balance = opening_cents
     for item in items:
-        if item["source"] == "known":
+        if item["source"] != "generated":
             balance += item["amount"]
             continue
 
@@ -588,6 +630,53 @@ def finalize_items(
         balance += amount
 
     return items
+
+
+def lowest_balance(opening_cents: int, items: list) -> int:
+    """The lowest running balance, counting the opening balance."""
+    lowest = balance = opening_cents
+    for item in items:
+        balance += item["amount"]
+        lowest = min(lowest, balance)
+    return lowest
+
+
+def finalize_with_salary(
+    opening_cents: int,
+    fixed: list,
+    generated: list,
+    start_date: date,
+    end_date: date,
+    seed: int,
+) -> list:
+    """
+    finalize_items for a statement that has salary rows. Salary dates are
+    fixed, so estimated debits that land before a pay day can push the
+    balance below zero. When that happens the estimated entries get new
+    random dates inside the gap (their amounts do not change) and the
+    statement is built again, keeping the attempt with the highest lowest
+    balance. The same seed always gives the same result.
+    """
+    best = finalize_items(opening_cents, fixed, generated, seed)
+    best_low = lowest_balance(opening_cents, best)
+    number_of_days = (end_date - start_date).days
+
+    for attempt in range(1, SALARY_DATE_RETRIES + 1):
+        if best_low >= 0:
+            break
+        rng = random.Random(seed * 1_000_003 + attempt)
+        moved = [
+            dict(item, date=start_date + timedelta(
+                days=rng.randint(0, number_of_days)
+            ))
+            for item in generated
+        ]
+        candidate = finalize_items(opening_cents, fixed, moved, seed + attempt)
+        candidate_low = lowest_balance(opening_cents, candidate)
+        if candidate_low > best_low:
+            best, best_low = candidate, candidate_low
+
+    return best
 
 
 def statement_frame(opening_cents: int, items: list) -> pd.DataFrame:
@@ -654,9 +743,11 @@ def verify_statement(
     credit_count: int,
     start_date: date,
     end_date: date,
+    salary_cents: int = 0,
 ) -> list:
     """Return a list of (passed, description) accuracy checks."""
     generated = [i for i in items if i["source"] == "generated"]
+    salary = [i for i in items if i["source"] == "salary"]
     gen_debits = [-i["amount"] for i in generated if i["amount"] < 0]
     gen_credits = [i["amount"] for i in generated if i["amount"] > 0]
 
@@ -715,20 +806,30 @@ def verify_statement(
             "Estimated entries are dated inside the gap dates",
         ))
 
-    # 7. Balance stays at or above zero (only checked when it is possible
-    #    to guarantee: no uploaded rows, non-negative opening and closing).
+    # Salary rows: one credit per month, on the 1st, for the amount entered.
+    if salary:
+        checks.append((
+            [i["date"] for i in salary] == salary_dates(start_date, end_date)
+            and all(i["amount"] == salary_cents for i in salary)
+            and all(i["remark"] == SALARY_REMARK for i in salary),
+            f"Salary: {plural(len(salary), 'credit')} of "
+            f"{from_cents(salary_cents)}, one on the 1st of each month",
+        ))
+
+    # 7. Balance stays at or above zero (not checked with uploaded rows or
+    #    a negative opening or closing balance). Without salary rows this
+    #    always holds; with salary rows it holds whenever the estimated
+    #    entries could be dated to fit around the pay days.
     if (
-        all(i["source"] == "generated" for i in items)
+        all(i["source"] != "known" for i in items)
         and opening_cents >= 0 and closing_cents >= 0
     ):
-        lowest = opening_cents
-        balance = opening_cents
-        for i in items:
-            balance += i["amount"]
-            lowest = min(lowest, balance)
+        lowest = lowest_balance(opening_cents, items)
+        hint = "" if lowest >= 0 else " - try another random seed"
         checks.append((
             lowest >= 0,
-            f"Balance never drops below zero (lowest: {from_cents(lowest)})",
+            f"Balance never drops below zero "
+            f"(lowest: {from_cents(lowest)}){hint}",
         ))
 
     # 8. No zero-amount rows.
@@ -889,6 +990,16 @@ else:
             step=1,
         )
 
+    salary_text = st.text_input(
+        "Monthly salary (optional)",
+        "0.00",
+        help=(
+            "Added as a credit on the 1st of every month between the gap "
+            f"dates, with the remark '{SALARY_REMARK}'. Salary credits are "
+            "extra to the number of credits above. Leave at 0 for no salary."
+        ),
+    )
+
     seed = st.number_input(
         "Random seed",
         min_value=0,
@@ -905,23 +1016,41 @@ else:
             if end_date < start_date:
                 raise ValueError("End date cannot be before start date.")
 
+            salary_cents = to_cents(salary_text) if salary_text.strip() else 0
+            if salary_cents < 0:
+                raise ValueError("Monthly salary cannot be negative.")
+
+            salary_entries = salary_items(salary_cents, start_date, end_date)
+            salary_total = sum(i["amount"] for i in salary_entries)
+
             expected_change = closing_cents - opening_cents
-            missing_net = expected_change - known_net_cents
+            missing_net = expected_change - known_net_cents - salary_total
 
-            summary_1, summary_2, summary_3 = st.columns(3)
+            summary = st.columns(4 if salary_entries else 3)
 
-            summary_1.metric(
+            summary[0].metric(
                 "Total balance change",
                 f"{money(expected_change)}"
             )
-            summary_2.metric(
+            summary[1].metric(
                 "Known transaction net",
                 f"{money(known_net_cents)}"
             )
-            summary_3.metric(
+            if salary_entries:
+                summary[2].metric(
+                    f"Salary ({plural(len(salary_entries), 'credit')})",
+                    f"{money(salary_total)}"
+                )
+            summary[-1].metric(
                 "Missing net amount",
                 f"{money(missing_net)}"
             )
+
+            if salary_cents > 0 and not salary_entries:
+                st.info(
+                    "No 1st of the month falls between the gap dates, so "
+                    "no salary entry was added."
+                )
 
             known_items = known_items_from_frame(known_frame, start_date) \
                 if len(known_frame) else []
@@ -935,9 +1064,15 @@ else:
                 seed=int(seed),
             )
 
-            items = finalize_items(
-                opening_cents, known_items, generated_items, int(seed)
-            )
+            if salary_entries:
+                items = finalize_with_salary(
+                    opening_cents, known_items + salary_entries,
+                    generated_items, start_date, end_date, int(seed),
+                )
+            else:
+                items = finalize_items(
+                    opening_cents, known_items, generated_items, int(seed)
+                )
 
             if not items:
                 st.success(
@@ -947,6 +1082,10 @@ else:
             else:
                 if missing_net == 0:
                     st.success(
+                        "The known transactions and salary entries already "
+                        "reconcile the balances, so no estimated entries "
+                        "were added."
+                        if salary_entries else
                         "The known transactions already reconcile the "
                         "balances, so no estimated entries were added."
                     )
@@ -977,6 +1116,7 @@ else:
                     credit_count=int(credit_count),
                     start_date=start_date,
                     end_date=end_date,
+                    salary_cents=salary_cents,
                 )
                 for passed, description in checks:
                     if passed:
