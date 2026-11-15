@@ -34,14 +34,21 @@ COLUMNS = [
     "Credits", "Balance", "Remarks"
 ]
 
+# The monthly card charge is always exactly this amount (500 = 5.00).
+CARD_FEE_REMARK = "SAMPLE CHARGES /// MONTH YEAR CARD MONTHLY FEES"
+CARD_FEE_CENTS = 500
+
 DEBIT_REMARKS = [
     "SAMPLE CASH WITHDRAWAL JOHN DOE TOWN A",
     "SAMPLE CASH WITHDRAWAL FROM ATM 000001 CITY X",
-    "SAMPLE CHARGES /// MONTH YEAR CARD MONTHLY FEES",
+    CARD_FEE_REMARK,
     "SAMPLE POS TRANSACTION FEE EXAMPLE-SERVICE.COM 000000 USD",
     "SAMPLE ONLINE PURCHASE EXAMPLE STORE",
     "SAMPLE TRANSFER OUT JANE ROE",
 ]
+
+# Debit remarks whose amount is free (everything but the card charge).
+OTHER_DEBIT_REMARKS = [r for r in DEBIT_REMARKS if r != CARD_FEE_REMARK]
 
 CREDIT_REMARKS = [
     "SAMPLE CASH DEPOSIT JOHN DOE TOWN A",
@@ -199,7 +206,9 @@ def round_atm_withdrawals(
             amounts[taker] -= carry
         return amounts, remarks
 
-    other_remarks = [r for r in DEBIT_REMARKS if not allowed_on_weekend(r)]
+    other_remarks = [
+        r for r in OTHER_DEBIT_REMARKS if not allowed_on_weekend(r)
+    ]
     if other_remarks:
         for k in atm:
             remarks[k] = rng.choice(other_remarks)
@@ -321,43 +330,20 @@ def tidy_amounts(amounts: list, big_count: int, rng: random.Random) -> list:
     return tidy
 
 
-def generate_items(
-    net_cents: int,
-    debit_count: int,
-    credit_count: int,
-    start_date: date,
-    end_date: date,
-    seed: int = 1,
+def generate_amounts(
+    net_cents: int, debit_count: int, credit_count: int, rng: random.Random
 ) -> list:
     """
-    Generate synthetic entries with exactly `debit_count` debits and
-    `credit_count` credits, where credits - debits equals net_cents.
-
-    Each item is a dict: date, amount (cents; credits positive, debits
-    negative), remark and source.
+    Exactly `debit_count` debit amounts (negative cents) and `credit_count`
+    credit amounts (positive cents), in random order, that add up to
+    net_cents. Raises ValueError when that is not possible.
     """
-    if debit_count < 0 or credit_count < 0:
-        raise ValueError("Entry counts cannot be negative.")
-
-    if end_date < start_date:
-        raise ValueError("End date cannot be before start date.")
-
     if net_cents == 0:
-        return []
-
-    if debit_count + credit_count < 1:
-        raise ValueError("Enter at least one debit or credit.")
-
-    every_day, working_days = gap_days(start_date, end_date)
-    if not working_days:
-        raise ValueError(
-            "The gap dates fall entirely on a weekend, when only ATM "
-            "transactions are possible. Choose dates that include a "
-            "working day (Monday to Friday)."
-        )
+        if debit_count + credit_count == 0:
+            return []
+        raise ValueError("Entries that add up to zero cannot be generated.")
 
     magnitude = abs(net_cents)
-    rng = random.Random(seed)
 
     if net_cents < 0 and debit_count < 1:
         raise ValueError(
@@ -461,12 +447,77 @@ def generate_items(
         ]
 
     rng.shuffle(amounts)
+    return amounts
+
+
+def generate_items(
+    net_cents: int,
+    debit_count: int,
+    credit_count: int,
+    start_date: date,
+    end_date: date,
+    seed: int = 1,
+) -> list:
+    """
+    Generate synthetic entries with exactly `debit_count` debits and
+    `credit_count` credits, where credits - debits equals net_cents.
+
+    Each item is a dict: date, amount (cents; credits positive, debits
+    negative), remark and source. Monthly card charges are always exactly
+    CARD_FEE_CENTS and ATM withdrawals never have cents.
+    """
+    if debit_count < 0 or credit_count < 0:
+        raise ValueError("Entry counts cannot be negative.")
+
+    if end_date < start_date:
+        raise ValueError("End date cannot be before start date.")
+
+    if net_cents == 0:
+        return []
+
+    if debit_count + credit_count < 1:
+        raise ValueError("Enter at least one debit or credit.")
+
+    every_day, working_days = gap_days(start_date, end_date)
+    if not working_days:
+        raise ValueError(
+            "The gap dates fall entirely on a weekend, when only ATM "
+            "transactions are possible. Choose dates that include a "
+            "working day (Monday to Friday)."
+        )
+
+    rng = random.Random(seed)
+
+    # Each debit has the same chance as before of being a monthly card
+    # charge. Those are always exactly CARD_FEE_CENTS, so they are set
+    # aside first and the other entries make up the rest of the amount.
+    # If the rest cannot be generated, fewer card charges are used.
+    fee_count = sum(
+        1 for _ in range(debit_count)
+        if rng.choice(DEBIT_REMARKS) == CARD_FEE_REMARK
+    )
+    while True:
+        try:
+            amounts = generate_amounts(
+                net_cents + fee_count * CARD_FEE_CENTS,
+                debit_count - fee_count,
+                credit_count,
+                rng,
+            )
+            break
+        except ValueError:
+            if fee_count == 0:
+                raise
+            fee_count -= 1
 
     remarks = [
-        rng.choice(DEBIT_REMARKS if amount < 0 else CREDIT_REMARKS)
+        rng.choice(OTHER_DEBIT_REMARKS if amount < 0 else CREDIT_REMARKS)
         for amount in amounts
     ]
     amounts, remarks = round_atm_withdrawals(amounts, remarks, rng)
+
+    amounts += [-CARD_FEE_CENTS] * fee_count
+    remarks += [CARD_FEE_REMARK] * fee_count
 
     items = []
     for amount, remark in zip(amounts, remarks):
@@ -964,6 +1015,18 @@ def verify_statement(
             f"(or the Monday after a weekend 1st)",
         ))
 
+    # Monthly card charges are always the fixed amount.
+    card_fees = [
+        -i["amount"] for i in generated
+        if i["remark"].startswith(CARD_FEE_REMARK)
+    ]
+    if card_fees:
+        checks.append((
+            all(a == CARD_FEE_CENTS for a in card_fees),
+            f"Every monthly card charge is exactly "
+            f"{from_cents(CARD_FEE_CENTS)}",
+        ))
+
     # ATM withdrawals never have cents.
     atm_withdrawals = [
         -i["amount"] for i in generated
@@ -1118,6 +1181,13 @@ elif mode == "Calculate opening balance":
 
 
 else:
+    # Default gap: the 1st of last month up to today, so the dates always
+    # include working days and at least one salary pay day.
+    today = date.today()
+    first_of_last_month = (
+        today.replace(day=1) - timedelta(days=1)
+    ).replace(day=1)
+
     left, right = st.columns(2)
 
     with left:
@@ -1127,7 +1197,7 @@ else:
         )
         start_date = st.date_input(
             "Gap start date",
-            value=date.today()
+            value=first_of_last_month
         )
 
     with right:
@@ -1137,7 +1207,7 @@ else:
         )
         end_date = st.date_input(
             "Gap end date",
-            value=date.today()
+            value=today
         )
 
     debit_col, credit_col = st.columns(2)
