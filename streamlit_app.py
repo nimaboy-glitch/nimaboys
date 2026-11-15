@@ -69,6 +69,7 @@ ATM_NOTE_CENTS = 100
 ESTIMATED_TAG = "(ESTIMATED / NOT BANK-SOURCED)"
 KNOWN_DEFAULT_REMARK = "KNOWN TRANSACTION (UPLOADED)"
 SALARY_REMARK = "SAMPLE SALARY ENTRY"
+SALARY_FIRST_DAY = 25       # salary is paid from the 25th to the month end
 DATE_RETRIES = 100          # tries at keeping the balance above zero
 
 KNOWN_DATE_COLUMNS = ["date", "trans. date", "trans_date", "transaction date"]
@@ -718,39 +719,49 @@ def known_items_from_frame(frame: pd.DataFrame, default_date: date) -> list:
 
 # ------------------------------ Salary -----------------------------------
 
-def salary_dates(start_date: date, end_date: date) -> list:
+def salary_windows(start_date: date, end_date: date) -> list:
     """
-    The pay day of every month that falls inside the gap dates. Pay day is
-    the 1st, or the Monday after it when the 1st is a Saturday or Sunday
-    (deposits are not made on weekends).
+    For every month of the gap, the days salary can be paid on: the working
+    days (Monday to Friday, deposits are not made on weekends) from the
+    25th to the end of the month that fall inside the gap dates. Months
+    with no such day are left out. Returns one list of dates per month.
     """
-    dates = []
+    windows = []
     year, month = start_date.year, start_date.month
     while date(year, month, 1) <= end_date:
-        pay_day = date(year, month, 1)
-        while is_weekend(pay_day):
-            pay_day += timedelta(days=1)
-        if start_date <= pay_day <= end_date:
-            dates.append(pay_day)
-        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
-    return dates
+        next_year, next_month = (
+            (year + 1, 1) if month == 12 else (year, month + 1)
+        )
+        month_end = date(next_year, next_month, 1) - timedelta(days=1)
+        window = gap_days(
+            max(date(year, month, SALARY_FIRST_DAY), start_date),
+            min(month_end, end_date),
+        )[1]
+        if window:
+            windows.append(window)
+        year, month = next_year, next_month
+    return windows
 
 
-def salary_items(amount_cents: int, start_date: date, end_date: date) -> list:
+def salary_items(
+    amount_cents: int, start_date: date, end_date: date, seed: int = 1
+) -> list:
     """
-    One salary credit of `amount_cents` on every pay day inside the gap
-    dates (see salary_dates). Salary is money coming IN, so it is a credit.
+    One salary credit of `amount_cents` per month, on a random pay day
+    from that month's window (see salary_windows). The same seed always
+    gives the same pay days. Salary is money coming IN, so it is a credit.
     """
     if amount_cents <= 0:
         return []
+    rng = random.Random(seed + 2)
     return [
         {
-            "date": pay_day,
+            "date": rng.choice(window),
             "amount": amount_cents,
             "remark": SALARY_REMARK,
             "source": "salary",
         }
-        for pay_day in salary_dates(start_date, end_date)
+        for window in salary_windows(start_date, end_date)
     ]
 
 
@@ -1004,15 +1015,18 @@ def verify_statement(
             "Estimated entries are dated inside the gap dates",
         ))
 
-    # Salary rows: one credit per month, on pay day, for the amount entered.
+    # Salary rows: one credit per month, on a pay day, for the amount
+    # entered.
     if salary:
+        windows = salary_windows(start_date, end_date)
         checks.append((
-            [i["date"] for i in salary] == salary_dates(start_date, end_date)
+            len(salary) == len(windows)
+            and all(i["date"] in w for i, w in zip(salary, windows))
             and all(i["amount"] == salary_cents for i in salary)
             and all(i["remark"] == SALARY_REMARK for i in salary),
             f"Salary: {plural(len(salary), 'credit')} of "
-            f"{from_cents(salary_cents)}, one each month on the 1st "
-            f"(or the Monday after a weekend 1st)",
+            f"{from_cents(salary_cents)}, one each month on a working day "
+            f"from the {SALARY_FIRST_DAY}th to the month end",
         ))
 
     # Monthly card charges are always the fixed amount.
@@ -1234,9 +1248,9 @@ else:
         "Monthly salary (optional)",
         "0.00",
         help=(
-            "Added as a credit on the 1st of every month between the gap "
-            "dates (the following Monday when the 1st is on a weekend), "
-            f"with the remark '{SALARY_REMARK}'. Salary credits are "
+            "Added as a credit once a month, on a working day (Monday to "
+            f"Friday) from the {SALARY_FIRST_DAY}th to the end of the "
+            f"month, with the remark '{SALARY_REMARK}'. Salary credits are "
             "extra to the number of credits above. Leave at 0 for no salary."
         ),
     )
@@ -1261,7 +1275,9 @@ else:
             if salary_cents < 0:
                 raise ValueError("Monthly salary cannot be negative.")
 
-            salary_entries = salary_items(salary_cents, start_date, end_date)
+            salary_entries = salary_items(
+                salary_cents, start_date, end_date, int(seed)
+            )
             salary_total = sum(i["amount"] for i in salary_entries)
 
             expected_change = closing_cents - opening_cents
@@ -1289,9 +1305,9 @@ else:
 
             if salary_cents > 0 and not salary_entries:
                 st.info(
-                    "No pay day (the 1st of a month, or the Monday after "
-                    "a weekend 1st) falls between the gap dates, so no "
-                    "salary entry was added."
+                    f"No pay day (a working day from the {SALARY_FIRST_DAY}"
+                    "th to the end of a month) falls between the gap "
+                    "dates, so no salary entry was added."
                 )
 
             known_items = known_items_from_frame(known_frame, start_date) \
