@@ -1,6 +1,7 @@
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import date, timedelta
 import csv
+import html
 import io
 import math
 import random
@@ -8,6 +9,19 @@ import re
 
 import pandas as pd
 import streamlit as st
+
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import (
+        BaseDocTemplate, Frame, PageTemplate, Paragraph, Spacer, Table,
+        TableStyle,
+    )
+    PDF_AVAILABLE = True
+except ImportError:
+    # Without the reportlab package the app still works, minus the PDF.
+    PDF_AVAILABLE = False
 
 
 # ----------------------------- Settings ---------------------------------
@@ -28,6 +42,17 @@ PROJECT_HEADER = "SCHOOL PROJECT"
 INDEX_NUMBER = "ED/13/0029"
 
 DATE_FORMAT = "%d-%b-%Y"              # e.g. 28-Feb-2026
+
+# Printed on every page of the PDF so it cannot be taken for a bank record.
+PDF_SUBTITLE = "Simulated statement entries - sample data, not a bank document"
+PDF_WATERMARK = "SAMPLE - NOT A BANK DOCUMENT"
+PDF_FOOTER = "SCHOOL PROJECT  |  SAMPLE DATA  |  NOT A BANK DOCUMENT"
+PDF_NOTE = (
+    "Rows marked (ESTIMATED / NOT BANK-SOURCED) were created by this tool "
+    "to reconcile the opening and closing balances. This document is a "
+    "school project sample. It is not issued by any bank and is not a "
+    "record of real transactions."
+)
 
 COLUMNS = [
     "Trans. Date", "Value. Date", "Debits",
@@ -1088,6 +1113,206 @@ def verify_statement(
     return checks
 
 
+# ------------------------------ PDF export -------------------------------
+
+def pdf_text(value) -> str:
+    """Text the PDF's built-in font can show; other characters become ?."""
+    text = "" if value is None else str(value)
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def statement_pdf(
+    with_totals: pd.DataFrame,
+    footer_rows: int,
+    opening_cents: int,
+    closing_cents: int,
+    start_date: date,
+    end_date: date,
+) -> bytes:
+    """
+    The statement table as a PDF. Every page carries the project header in
+    bold, a SAMPLE watermark across the page and a footer, so no page can
+    be mistaken for a bank document. `footer_rows` is the number of total
+    rows at the end of `with_totals`.
+    """
+    page_width, page_height = A4
+    margin = 36
+    header_height = 104
+    ink = colors.HexColor("#1F4E79")
+    soft = colors.HexColor("#F2F6FA")
+    line = colors.HexColor("#C9D3DF")
+
+    small = ParagraphStyle("small", fontName="Helvetica", fontSize=7.5,
+                           leading=9.5)
+    label = ParagraphStyle("label", fontName="Helvetica", fontSize=7.5,
+                           leading=10, textColor=colors.HexColor("#5B6B7C"))
+    value = ParagraphStyle("value", fontName="Helvetica-Bold", fontSize=10,
+                           leading=13)
+    note = ParagraphStyle("note", fontName="Helvetica-Oblique", fontSize=8,
+                          leading=11, textColor=colors.HexColor("#5B6B7C"))
+
+    entries = len(with_totals) - footer_rows
+    debit_count = int((with_totals["Debits"].iloc[:entries] != "").sum())
+    credit_count = int((with_totals["Credits"].iloc[:entries] != "").sum())
+
+    def story() -> list:
+        summary = Table(
+            [[
+                [Paragraph("PERIOD", label), Paragraph(
+                    f"{start_date.strftime(DATE_FORMAT)} to "
+                    f"{end_date.strftime(DATE_FORMAT)}", value)],
+                [Paragraph("OPENING BALANCE", label),
+                 Paragraph(from_cents(opening_cents), value)],
+                [Paragraph("CLOSING BALANCE", label),
+                 Paragraph(from_cents(closing_cents), value)],
+                [Paragraph("ENTRIES", label), Paragraph(
+                    f"{plural(debit_count, 'debit')}, "
+                    f"{plural(credit_count, 'credit')}", value)],
+            ]],
+            colWidths=[172, 110, 110, 131],
+        )
+        summary.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), soft),
+            ("BOX", (0, 0), (-1, -1), 0.6, line),
+            ("LINEBEFORE", (1, 0), (-1, -1), 0.6, line),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 7),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LEFTPADDING", (0, 0), (-1, -1), 9),
+        ]))
+
+        rows = [list(COLUMNS)]
+        for _, row in with_totals.iterrows():
+            rows.append([
+                pdf_text(row["Trans. Date"]), pdf_text(row["Value. Date"]),
+                pdf_text(row["Debits"]), pdf_text(row["Credits"]),
+                pdf_text(row["Balance"]),
+                Paragraph(html.escape(pdf_text(row["Remarks"])), small),
+            ])
+        first_total = len(rows) - footer_rows
+
+        # A total row's label ("Uncleared Amount") is wider than one date
+        # column, so it takes both: "Uncleared Amount: 0".
+        spans = []
+        for index in range(first_total, len(rows)):
+            if rows[index][1]:
+                rows[index][0] += f": {rows[index][1]}"
+                rows[index][1] = ""
+            spans.append(("SPAN", (0, index), (1, index)))
+        table = Table(
+            rows, colWidths=[60, 60, 62, 62, 68, 211], repeatRows=1
+        )
+        table.setStyle(TableStyle([
+            ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 8),
+            ("FONT", (0, 1), (-1, -1), "Helvetica", 8),
+            ("BACKGROUND", (0, 0), (-1, 0), ink),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("ROWBACKGROUNDS", (0, 1), (-1, first_total - 1),
+             [colors.white, soft]),
+            ("ALIGN", (2, 0), (4, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.4, line),
+            ("BOX", (0, 0), (-1, -1), 0.6, line),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            # The totals at the end.
+            ("FONT", (0, first_total), (-1, -1), "Helvetica-Bold", 8),
+            ("LINEABOVE", (0, first_total), (-1, first_total), 1, ink),
+        ] + spans))
+
+        return [summary, Spacer(1, 12), table, Spacer(1, 12),
+                Paragraph(PDF_NOTE, note)]
+
+    def render(total_pages: int) -> tuple:
+        pages = []
+
+        def draw_page(canvas, doc):
+            """Header and footer, drawn before the page content."""
+            pages.append(doc.page)
+            canvas.saveState()
+            canvas.setFillColor(ink)
+            canvas.rect(0, page_height - 10, page_width, 10, stroke=0, fill=1)
+            canvas.setFont("Helvetica-Bold", 24)
+            canvas.drawCentredString(
+                page_width / 2, page_height - 46, pdf_text(PROJECT_HEADER)
+            )
+            canvas.setFillColor(colors.black)
+            canvas.setFont("Helvetica-Bold", 11)
+            canvas.drawCentredString(
+                page_width / 2, page_height - 63,
+                pdf_text(f"Index Number: {INDEX_NUMBER}"),
+            )
+            canvas.setFillColor(colors.HexColor("#B42318"))
+            canvas.setFont("Helvetica-Bold", 9)
+            canvas.drawCentredString(
+                page_width / 2, page_height - 78, PDF_SUBTITLE
+            )
+            canvas.setStrokeColor(line)
+            canvas.setLineWidth(0.8)
+            canvas.line(margin, page_height - 90,
+                        page_width - margin, page_height - 90)
+
+            canvas.line(margin, 38, page_width - margin, 38)
+            canvas.setFillColor(colors.HexColor("#5B6B7C"))
+            canvas.setFont("Helvetica-Bold", 7.5)
+            canvas.drawString(margin, 26, PDF_FOOTER)
+            canvas.setFont("Helvetica", 7.5)
+            canvas.drawRightString(
+                page_width - margin, 26,
+                f"Page {doc.page} of {total_pages}",
+            )
+            canvas.restoreState()
+
+        def draw_watermark(canvas, doc):
+            """Drawn last, across the page content, three times a page."""
+            canvas.saveState()
+            canvas.setFillColor(colors.HexColor("#B42318"))
+            canvas.setFillAlpha(0.13)
+            canvas.setFont("Helvetica-Bold", 34)
+            for centre_y in (page_height * 0.78, page_height * 0.5,
+                             page_height * 0.22):
+                canvas.saveState()
+                canvas.translate(page_width / 2, centre_y)
+                canvas.rotate(28)
+                canvas.drawCentredString(0, 0, PDF_WATERMARK)
+                canvas.restoreState()
+            canvas.restoreState()
+
+        buffer = io.BytesIO()
+        document = BaseDocTemplate(
+            buffer, pagesize=A4,
+            title=pdf_text(f"{PROJECT_HEADER} - sample statement entries"),
+            author="Balance Reconciliation Tool",
+            subject=PDF_SUBTITLE,
+        )
+        frame = Frame(
+            margin, 46, page_width - 2 * margin,
+            page_height - 46 - header_height,
+            leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0,
+        )
+        document.addPageTemplates(PageTemplate(
+            frames=[frame], onPage=draw_page, onPageEnd=draw_watermark,
+        ))
+        document.build(story())
+        return buffer.getvalue(), len(pages)
+
+    # Built twice: the first pass only counts the pages for "Page 1 of N".
+    _, total_pages = render(0)
+    return render(total_pages)[0]
+
+
+def download_button(label: str, data, file_name: str, mime: str) -> None:
+    """
+    A download button. On Streamlit 1.43 and newer a click does not reload
+    the page, so the results stay on screen for the next download.
+    """
+    version = tuple(int(n) for n in st.__version__.split(".")[:2])
+    extra = {"on_click": "ignore"} if version >= (1, 43) else {}
+    st.download_button(
+        label, data=data, file_name=file_name, mime=mime, **extra
+    )
+
+
 def show_table(frame: pd.DataFrame) -> None:
     """Display a table full width on both old and new Streamlit versions."""
     try:
@@ -1396,16 +1621,39 @@ else:
                         f"{from_cents(BIG_THRESHOLD_CENTS)}: {big_credits}."
                     )
 
-                st.download_button(
-                    "Download statement entries",
-                    data=(
-                        f"{PROJECT_HEADER}\n"
-                        f"Index Number: {INDEX_NUMBER}\n\n"
-                        + with_totals.to_csv(index=False)
-                    ),
-                    file_name="statement_entries.csv",
-                    mime="text/csv",
-                )
+                csv_column, pdf_column = st.columns(2)
+
+                with csv_column:
+                    download_button(
+                        "Download statement entries (CSV)",
+                        data=(
+                            f"{PROJECT_HEADER}\n"
+                            f"Index Number: {INDEX_NUMBER}\n\n"
+                            + with_totals.to_csv(index=False)
+                        ),
+                        file_name="statement_entries.csv",
+                        mime="text/csv",
+                    )
+
+                with pdf_column:
+                    if PDF_AVAILABLE:
+                        download_button(
+                            "Download statement entries (PDF)",
+                            data=statement_pdf(
+                                with_totals,
+                                len(with_totals) - len(table),
+                                opening_cents, closing_cents,
+                                start_date, end_date,
+                            ),
+                            file_name="statement_entries.pdf",
+                            mime="application/pdf",
+                        )
+                    else:
+                        st.info(
+                            "The PDF download needs the 'reportlab' "
+                            "package. Add a line saying reportlab to "
+                            "requirements.txt."
+                        )
 
         except Exception as exc:
             st.error(str(exc))
