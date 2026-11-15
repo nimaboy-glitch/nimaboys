@@ -50,10 +50,19 @@ CREDIT_REMARKS = [
     "SAMPLE INTEREST CREDIT",
 ]
 
+# Weekend rule: on Saturdays and Sundays only ATM transactions are possible.
+# A remark is an ATM transaction when it contains the word "ATM", so any
+# remark added above with "ATM" in it may also fall on a weekend.
+
+# An ATM never pays out cents: every ATM withdrawal is a whole number such
+# as 20.00, 48.00 or 51.00, never 20.83. The value is the step in cents
+# (100 = whole numbers; 1000 would allow only multiples of 10.00).
+ATM_NOTE_CENTS = 100
+
 ESTIMATED_TAG = "(ESTIMATED / NOT BANK-SOURCED)"
 KNOWN_DEFAULT_REMARK = "KNOWN TRANSACTION (UPLOADED)"
 SALARY_REMARK = "SAMPLE SALARY ENTRY"
-SALARY_DATE_RETRIES = 100   # tries at keeping the balance above zero
+DATE_RETRIES = 100          # tries at keeping the balance above zero
 
 KNOWN_DATE_COLUMNS = ["date", "trans. date", "trans_date", "transaction date"]
 KNOWN_REMARK_COLUMNS = [
@@ -97,6 +106,104 @@ def money(cents: int) -> str:
 def plural(count: int, word: str) -> str:
     """'1 Debit', '2 Debits'."""
     return f"{count} {word}" if count == 1 else f"{count} {word}s"
+
+
+# ---------------------------- Weekend rule -------------------------------
+
+def is_weekend(day: date) -> bool:
+    """Saturday or Sunday."""
+    return day.weekday() >= 5
+
+
+def allowed_on_weekend(remark: str) -> bool:
+    """Only ATM transactions can be done on a Saturday or Sunday."""
+    return re.search(r"\bATM\b", remark, re.IGNORECASE) is not None
+
+
+def gap_days(start_date: date, end_date: date) -> tuple:
+    """(every day, working days only) from start_date to end_date."""
+    every_day = [
+        start_date + timedelta(days=n)
+        for n in range((end_date - start_date).days + 1)
+    ]
+    return every_day, [day for day in every_day if not is_weekend(day)]
+
+
+def entry_date(
+    rng: random.Random, remark: str, every_day: list, working_days: list
+) -> date:
+    """A random date for an entry: any day for ATM, else Monday-Friday."""
+    return rng.choice(
+        every_day if allowed_on_weekend(remark) else working_days
+    )
+
+
+def round_atm_withdrawals(
+    amounts: list, remarks: list, rng: random.Random
+) -> tuple:
+    """
+    Make every ATM withdrawal a whole amount with no cents (a multiple of
+    ATM_NOTE_CENTS). The cents taken off or added are moved to the largest
+    other debit that can take them, so the total of the debits, the number
+    of entries and the entries above 2,000.00 all stay the same.
+
+    When no other debit can take the difference (for example the ATM
+    withdrawal is the only debit), the ATM remarks are swapped for other
+    debit remarks instead, so the amounts stay as they are.
+
+    `amounts` are signed cents (debits negative). Returns new
+    (amounts, remarks) lists.
+    """
+    amounts, remarks = list(amounts), list(remarks)
+    atm = [
+        k for k, (amount, remark) in enumerate(zip(amounts, remarks))
+        if amount < 0 and allowed_on_weekend(remark)
+    ]
+    if not atm:
+        return amounts, remarks
+
+    def still_fits(before: int, after: int) -> bool:
+        """Still a valid debit, on the same side of 2,000.00."""
+        return after >= MIN_DEBIT_CENTS and (
+            (before > BIG_THRESHOLD_CENTS) == (after > BIG_THRESHOLD_CENTS)
+        )
+
+    # Round each withdrawal to the nearest whole amount, carrying what was
+    # cut off into the next one so the leftover stays small.
+    notes = {}
+    carry = 0
+    for k in atm:
+        wanted = -amounts[k] + carry
+        notes[k] = max(
+            ATM_NOTE_CENTS,
+            (wanted + ATM_NOTE_CENTS // 2) // ATM_NOTE_CENTS * ATM_NOTE_CENTS,
+        )
+        carry = wanted - notes[k]
+
+    # The leftover goes to the largest non-ATM debit that can take it.
+    others = sorted(
+        (k for k, amount in enumerate(amounts) if amount < 0 and k not in atm),
+        key=lambda k: amounts[k],
+    )
+    taker = next(
+        (k for k in others if still_fits(-amounts[k], -amounts[k] + carry)),
+        None,
+    )
+
+    if (carry == 0 or taker is not None) and all(
+        still_fits(-amounts[k], notes[k]) for k in atm
+    ):
+        for k in atm:
+            amounts[k] = -notes[k]
+        if carry != 0:
+            amounts[taker] -= carry
+        return amounts, remarks
+
+    other_remarks = [r for r in DEBIT_REMARKS if not allowed_on_weekend(r)]
+    if other_remarks:
+        for k in atm:
+            remarks[k] = rng.choice(other_remarks)
+    return amounts, remarks
 
 
 # ------------------------- Amount generation -----------------------------
@@ -241,6 +348,14 @@ def generate_items(
     if debit_count + credit_count < 1:
         raise ValueError("Enter at least one debit or credit.")
 
+    every_day, working_days = gap_days(start_date, end_date)
+    if not working_days:
+        raise ValueError(
+            "The gap dates fall entirely on a weekend, when only ATM "
+            "transactions are possible. Choose dates that include a "
+            "working day (Monday to Friday)."
+        )
+
     magnitude = abs(net_cents)
     rng = random.Random(seed)
 
@@ -347,16 +462,19 @@ def generate_items(
 
     rng.shuffle(amounts)
 
-    number_of_days = (end_date - start_date).days
+    remarks = [
+        rng.choice(DEBIT_REMARKS if amount < 0 else CREDIT_REMARKS)
+        for amount in amounts
+    ]
+    amounts, remarks = round_atm_withdrawals(amounts, remarks, rng)
+
     items = []
-    for amount in amounts:
-        pool = DEBIT_REMARKS if amount < 0 else CREDIT_REMARKS
+    for amount, remark in zip(amounts, remarks):
         items.append({
-            "date": start_date + timedelta(
-                days=rng.randint(0, number_of_days)
-            ),
+            # ATM entries can land on any day, everything else Mon-Fri.
+            "date": entry_date(rng, remark, every_day, working_days),
             "amount": amount,
-            "remark": f"{rng.choice(pool)} {ESTIMATED_TAG}",
+            "remark": f"{remark} {ESTIMATED_TAG}",
             "source": "generated",
         })
 
@@ -550,22 +668,27 @@ def known_items_from_frame(frame: pd.DataFrame, default_date: date) -> list:
 # ------------------------------ Salary -----------------------------------
 
 def salary_dates(start_date: date, end_date: date) -> list:
-    """Every 1st of a month from start_date to end_date (both included)."""
-    year, month = start_date.year, start_date.month
-    if start_date.day > 1:
-        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
-
+    """
+    The pay day of every month that falls inside the gap dates. Pay day is
+    the 1st, or the Monday after it when the 1st is a Saturday or Sunday
+    (deposits are not made on weekends).
+    """
     dates = []
+    year, month = start_date.year, start_date.month
     while date(year, month, 1) <= end_date:
-        dates.append(date(year, month, 1))
+        pay_day = date(year, month, 1)
+        while is_weekend(pay_day):
+            pay_day += timedelta(days=1)
+        if start_date <= pay_day <= end_date:
+            dates.append(pay_day)
         year, month = (year + 1, 1) if month == 12 else (year, month + 1)
     return dates
 
 
 def salary_items(amount_cents: int, start_date: date, end_date: date) -> list:
     """
-    One salary credit of `amount_cents` on the 1st of every month inside
-    the gap dates. Salary is money coming IN, so it is a credit.
+    One salary credit of `amount_cents` on every pay day inside the gap
+    dates (see salary_dates). Salary is money coming IN, so it is a credit.
     """
     if amount_cents <= 0:
         return []
@@ -596,42 +719,6 @@ def sort_items(items: list) -> list:
     )
 
 
-def finalize_items(
-    opening_cents: int, fixed: list, generated: list, seed: int
-) -> list:
-    """
-    Combine fixed entries (known and salary rows) and estimated entries in
-    date order. The estimated amounts are re-ordered across their dates so
-    the balance stays at or above zero whenever possible (like a real
-    account). Totals and dates do not change, only which amount lands on
-    which date. Fixed entries are never moved or changed.
-    """
-    rng = random.Random(seed + 1)
-    items = [dict(i) for i in sort_items(fixed + generated)]
-
-    pool = [(i["amount"], i["remark"]) for i in items
-            if i["source"] == "generated"]
-
-    balance = opening_cents
-    for item in items:
-        if item["source"] != "generated":
-            balance += item["amount"]
-            continue
-
-        feasible = [k for k, (a, _) in enumerate(pool) if balance + a >= 0]
-        if feasible:
-            pick = rng.choice(feasible)
-        else:
-            # Nothing fits: take the largest credit (or the smallest debit).
-            pick = max(range(len(pool)), key=lambda k: pool[k][0])
-
-        amount, remark = pool.pop(pick)
-        item["amount"], item["remark"] = amount, remark
-        balance += amount
-
-    return items
-
-
 def lowest_balance(opening_cents: int, items: list) -> int:
     """The lowest running balance, counting the opening balance."""
     lowest = balance = opening_cents
@@ -641,7 +728,59 @@ def lowest_balance(opening_cents: int, items: list) -> int:
     return lowest
 
 
-def finalize_with_salary(
+def finalize_items(
+    opening_cents: int, fixed: list, generated: list, seed: int
+) -> list:
+    """
+    Combine fixed entries (known and salary rows) and estimated entries in
+    date order. The estimated amounts are re-ordered across their dates so
+    the balance stays at or above zero whenever possible (like a real
+    account). Totals and dates do not change, only which amount lands on
+    which date. Fixed entries are never moved or changed, and a weekend
+    date is only ever given an ATM entry.
+    """
+    rng = random.Random(seed + 1)
+    items = [dict(i) for i in sort_items(fixed + generated)]
+
+    pool = [(i["amount"], i["remark"]) for i in items
+            if i["source"] == "generated"]
+    weekend_dates_left = sum(
+        1 for i in items
+        if i["source"] == "generated" and is_weekend(i["date"])
+    )
+
+    balance = opening_cents
+    for item in items:
+        if item["source"] != "generated":
+            balance += item["amount"]
+            continue
+
+        atm = {k for k, (_, r) in enumerate(pool) if allowed_on_weekend(r)}
+        if is_weekend(item["date"]):
+            # Only an ATM entry can go on a weekend.
+            choices = sorted(atm)
+            weekend_dates_left -= 1
+        elif len(atm) > weekend_dates_left:
+            choices = list(range(len(pool)))
+        else:
+            # Save the last ATM entries for the weekend dates still to come.
+            choices = [k for k in range(len(pool)) if k not in atm]
+
+        feasible = [k for k in choices if balance + pool[k][0] >= 0]
+        if feasible:
+            pick = rng.choice(feasible)
+        else:
+            # Nothing fits: take the largest credit (or the smallest debit).
+            pick = max(choices, key=lambda k: pool[k][0])
+
+        amount, remark = pool.pop(pick)
+        item["amount"], item["remark"] = amount, remark
+        balance += amount
+
+    return items
+
+
+def finalize_statement(
     opening_cents: int,
     fixed: list,
     generated: list,
@@ -650,24 +789,32 @@ def finalize_with_salary(
     seed: int,
 ) -> list:
     """
-    finalize_items for a statement that has salary rows. Salary dates are
-    fixed, so estimated debits that land before a pay day can push the
-    balance below zero. When that happens the estimated entries get new
-    random dates inside the gap (their amounts do not change) and the
+    finalize_items, repeated when the balance would drop below zero.
+
+    Fixed rows (known, salary) and the weekend rule limit where entries
+    can go, so estimated debits can land before the money that covers
+    them. When that happens the estimated entries get new random dates
+    (same amounts and remarks, still following the weekend rule) and the
     statement is built again, keeping the attempt with the highest lowest
     balance. The same seed always gives the same result.
     """
     best = finalize_items(opening_cents, fixed, generated, seed)
-    best_low = lowest_balance(opening_cents, best)
-    number_of_days = (end_date - start_date).days
+    if not generated:
+        return best
 
-    for attempt in range(1, SALARY_DATE_RETRIES + 1):
-        if best_low >= 0:
+    closing_cents = opening_cents + sum(i["amount"] for i in best)
+    # A negative opening or closing balance cannot be avoided.
+    target = min(0, opening_cents, closing_cents)
+    best_low = lowest_balance(opening_cents, best)
+    every_day, working_days = gap_days(start_date, end_date)
+
+    for attempt in range(1, DATE_RETRIES + 1):
+        if best_low >= target:
             break
         rng = random.Random(seed * 1_000_003 + attempt)
         moved = [
-            dict(item, date=start_date + timedelta(
-                days=rng.randint(0, number_of_days)
+            dict(item, date=entry_date(
+                rng, item["remark"], every_day, working_days
             ))
             for item in generated
         ]
@@ -806,20 +953,43 @@ def verify_statement(
             "Estimated entries are dated inside the gap dates",
         ))
 
-    # Salary rows: one credit per month, on the 1st, for the amount entered.
+    # Salary rows: one credit per month, on pay day, for the amount entered.
     if salary:
         checks.append((
             [i["date"] for i in salary] == salary_dates(start_date, end_date)
             and all(i["amount"] == salary_cents for i in salary)
             and all(i["remark"] == SALARY_REMARK for i in salary),
             f"Salary: {plural(len(salary), 'credit')} of "
-            f"{from_cents(salary_cents)}, one on the 1st of each month",
+            f"{from_cents(salary_cents)}, one each month on the 1st "
+            f"(or the Monday after a weekend 1st)",
+        ))
+
+    # ATM withdrawals never have cents.
+    atm_withdrawals = [
+        -i["amount"] for i in generated
+        if i["amount"] < 0 and allowed_on_weekend(i["remark"])
+    ]
+    if atm_withdrawals:
+        checks.append((
+            all(a % ATM_NOTE_CENTS == 0 for a in atm_withdrawals),
+            f"Every ATM withdrawal is a whole amount with no cents "
+            f"(a multiple of {from_cents(ATM_NOTE_CENTS)})",
+        ))
+
+    # Weekend rule (uploaded rows are left exactly as uploaded).
+    if generated or salary:
+        checks.append((
+            all(
+                allowed_on_weekend(i["remark"]) or not is_weekend(i["date"])
+                for i in generated + salary
+            ),
+            "Only ATM entries fall on a Saturday or Sunday",
         ))
 
     # 7. Balance stays at or above zero (not checked with uploaded rows or
-    #    a negative opening or closing balance). Without salary rows this
-    #    always holds; with salary rows it holds whenever the estimated
-    #    entries could be dated to fit around the pay days.
+    #    a negative opening or closing balance). It holds whenever the
+    #    estimated entries could be dated to fit around the pay days and
+    #    the weekend rule.
     if (
         all(i["source"] != "known" for i in items)
         and opening_cents >= 0 and closing_cents >= 0
@@ -995,7 +1165,8 @@ else:
         "0.00",
         help=(
             "Added as a credit on the 1st of every month between the gap "
-            f"dates, with the remark '{SALARY_REMARK}'. Salary credits are "
+            "dates (the following Monday when the 1st is on a weekend), "
+            f"with the remark '{SALARY_REMARK}'. Salary credits are "
             "extra to the number of credits above. Leave at 0 for no salary."
         ),
     )
@@ -1048,8 +1219,9 @@ else:
 
             if salary_cents > 0 and not salary_entries:
                 st.info(
-                    "No 1st of the month falls between the gap dates, so "
-                    "no salary entry was added."
+                    "No pay day (the 1st of a month, or the Monday after "
+                    "a weekend 1st) falls between the gap dates, so no "
+                    "salary entry was added."
                 )
 
             known_items = known_items_from_frame(known_frame, start_date) \
@@ -1064,15 +1236,10 @@ else:
                 seed=int(seed),
             )
 
-            if salary_entries:
-                items = finalize_with_salary(
-                    opening_cents, known_items + salary_entries,
-                    generated_items, start_date, end_date, int(seed),
-                )
-            else:
-                items = finalize_items(
-                    opening_cents, known_items, generated_items, int(seed)
-                )
+            items = finalize_statement(
+                opening_cents, known_items + salary_entries,
+                generated_items, start_date, end_date, int(seed),
+            )
 
             if not items:
                 st.success(
