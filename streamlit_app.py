@@ -43,6 +43,9 @@ INDEX_NUMBER = "ED/13/0029"
 
 DATE_FORMAT = "%d-%b-%Y"              # e.g. 28-Feb-2026
 
+# Account holder shown on the statement.
+CUSTOMER_NAME = "SABAR GARBA NYAMKENE"
+
 # Printed on every page of the PDF so it cannot be taken for a bank record.
 PDF_SUBTITLE = "Simulated statement entries - sample data, not a bank document"
 PDF_WATERMARK = "SAMPLE - NOT A BANK DOCUMENT"
@@ -60,26 +63,23 @@ COLUMNS = [
 ]
 
 # The monthly card charge is always exactly this amount (500 = 5.00).
-CARD_FEE_REMARK = "SAMPLE CHARGES /// MONTH YEAR CARD MONTHLY FEES"
+CARD_FEE_REMARK = "CHARGES WS 10 OCTOBER 2025 VISA MONTHLY FEES 19/10/2025"
 CARD_FEE_CENTS = 500
 
 DEBIT_REMARKS = [
-    "SAMPLE CASH WITHDRAWAL JOHN DOE TOWN A",
-    "SAMPLE CASH WITHDRAWAL FROM ATM 000001 CITY X",
+    f"CASH WITHDRAWAL {CUSTOMER_NAME}",
+    "CASH WITHDRAWAL FROM OUR ATM GTB000000000770 KASOA 00228KASOA KASOA",
     CARD_FEE_REMARK,
-    "SAMPLE POS TRANSACTION FEE EXAMPLE-SERVICE.COM 000000 USD",
-    "SAMPLE ONLINE PURCHASE EXAMPLE STORE",
-    "SAMPLE TRANSFER OUT JANE ROE",
+    "POS TRANSACTION FEE ZOOM.US 888-769-9686 0000144 2026-10-20 CA 206.00 USD",
+    "CASH WITHDRAWAL FROM OUR ATM GTB000000000901 KASOA 00228KASOA KASOA",
 ]
 
 # Debit remarks whose amount is free (everything but the card charge).
 OTHER_DEBIT_REMARKS = [r for r in DEBIT_REMARKS if r != CARD_FEE_REMARK]
 
 CREDIT_REMARKS = [
-    "SAMPLE CASH DEPOSIT JOHN DOE TOWN A",
-    "SAMPLE TRANSFER IN JANE ROE",
-    "SAMPLE REFUND EXAMPLE STORE",
-    "SAMPLE INTEREST CREDIT",
+    f"CASH DEPOSITE {CUSTOMER_NAME}",     # GTBank spells it this way
+    f"TRANSFER IN {CUSTOMER_NAME}",
 ]
 
 # Weekend rule: on Saturdays and Sundays only ATM transactions are possible.
@@ -91,9 +91,9 @@ CREDIT_REMARKS = [
 # (100 = whole numbers; 1000 would allow only multiples of 10.00).
 ATM_NOTE_CENTS = 100
 
-ESTIMATED_TAG = "(ESTIMATED / NOT BANK-SOURCED)"
+ESTIMATED_TAG = ""
 KNOWN_DEFAULT_REMARK = "KNOWN TRANSACTION (UPLOADED)"
-SALARY_REMARK = "SAMPLE SALARY ENTRY"
+SALARY_REMARK = "SALARY"
 SALARY_FIRST_DAY = 25       # salary is paid from the 25th to the month end
 DATE_RETRIES = 100          # tries at keeping the balance above zero
 
@@ -551,7 +551,7 @@ def generate_items(
             # ATM entries can land on any day, everything else Mon-Fri.
             "date": entry_date(rng, remark, every_day, working_days),
             "amount": amount,
-            "remark": f"{remark} {ESTIMATED_TAG}",
+            "remark": f"{remark} {ESTIMATED_TAG}".strip(),
             "source": "generated",
         })
 
@@ -1115,10 +1115,40 @@ def verify_statement(
 
 # ------------------------------ PDF export -------------------------------
 
+CUSTOMER_NAME = CUSTOMER_NAME
+BRANCH_NAME = "RING ROAD BRANCH"
+ACCOUNT_NO = "1219001246482"
+ADDRESS = "P.O.BOX M43, ACCRA"
+ACCOUNT_TYPE = "SAVINGS ACCOUNT"
+CURRENCY = "GHANA CEDI"
+
+NAVY = colors.HexColor("#16233C")
+PANEL = colors.HexColor("#F5F5F5")
+RULE = colors.HexColor("#D9D9D9")
+LABEL_INK = colors.HexColor("#2B2B2B")
+VALUE_INK = colors.HexColor("#5A5A5A")
+
+MARGIN_L = 40
+MARGIN_R = 40
+BAR_W = 9
+
+
 def pdf_text(value) -> str:
     """Text the PDF's built-in font can show; other characters become ?."""
     text = "" if value is None else str(value)
     return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def draw_logo(canvas, x, y, size):
+    canvas.saveState()
+    canvas.setFillColor(NAVY)
+    canvas.roundRect(x, y, size, size, 3, stroke=0, fill=1)
+    canvas.setFillColor(colors.white)
+    canvas.setFont("Helvetica-Bold", 8.2)
+    canvas.drawCentredString(x + size / 2, y + size - 13, "GTBank")
+    canvas.setFont("Helvetica", 2.7)
+    canvas.drawCentredString(x + size / 2, y + 5.5, "Guaranty Trust Bank")
+    canvas.restoreState()
 
 
 def statement_pdf(
@@ -1128,143 +1158,125 @@ def statement_pdf(
     closing_cents: int,
     start_date: date,
     end_date: date,
+    customer_name: str = CUSTOMER_NAME,
+    watermark: bool = False,
+    show_note: bool = False,
 ) -> bytes:
-    """
-    The statement table as a PDF. Every page carries the project header in
-    bold, a SAMPLE watermark across the page and a footer, so no page can
-    be mistaken for a bank document. `footer_rows` is the number of total
-    rows at the end of `with_totals`.
-    """
+    """The statement table laid out as a GTBank customer statement."""
     page_width, page_height = A4
-    margin = 36
-    header_height = 104
-    ink = colors.HexColor("#1F4E79")
-    soft = colors.HexColor("#F2F6FA")
-    line = colors.HexColor("#C9D3DF")
+    header_bottom = page_height - 312
+    body = ParagraphStyle("body", fontName="Helvetica", fontSize=7.6,
+                          leading=9.4)
+    note = ParagraphStyle("note", fontName="Helvetica-Oblique", fontSize=7,
+                          leading=9.5, textColor=VALUE_INK)
 
-    small = ParagraphStyle("small", fontName="Helvetica", fontSize=7.5,
-                           leading=9.5)
-    label = ParagraphStyle("label", fontName="Helvetica", fontSize=7.5,
-                           leading=10, textColor=colors.HexColor("#5B6B7C"))
-    value = ParagraphStyle("value", fontName="Helvetica-Bold", fontSize=10,
-                           leading=13)
-    note = ParagraphStyle("note", fontName="Helvetica-Oblique", fontSize=8,
-                          leading=11, textColor=colors.HexColor("#5B6B7C"))
-
-    entries = len(with_totals) - footer_rows
-    debit_count = int((with_totals["Debits"].iloc[:entries] != "").sum())
-    credit_count = int((with_totals["Credits"].iloc[:entries] != "").sum())
+    fields = [
+        ("Print Date", date.today().strftime(DATE_FORMAT)),
+        ("Branch Name", BRANCH_NAME),
+        ("Account No", ACCOUNT_NO),
+        ("Address", ADDRESS),
+        ("Account Type", ACCOUNT_TYPE),
+        ("Currency", CURRENCY),
+        ("Opening Balance", from_cents(opening_cents)),
+        ("Closing Balance", from_cents(closing_cents)),
+    ]
 
     def story() -> list:
-        summary = Table(
-            [[
-                [Paragraph("PERIOD", label), Paragraph(
-                    f"{start_date.strftime(DATE_FORMAT)} to "
-                    f"{end_date.strftime(DATE_FORMAT)}", value)],
-                [Paragraph("OPENING BALANCE", label),
-                 Paragraph(from_cents(opening_cents), value)],
-                [Paragraph("CLOSING BALANCE", label),
-                 Paragraph(from_cents(closing_cents), value)],
-                [Paragraph("ENTRIES", label), Paragraph(
-                    f"{plural(debit_count, 'debit')}, "
-                    f"{plural(credit_count, 'credit')}", value)],
-            ]],
-            colWidths=[172, 110, 110, 131],
-        )
-        summary.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, -1), soft),
-            ("BOX", (0, 0), (-1, -1), 0.6, line),
-            ("LINEBEFORE", (1, 0), (-1, -1), 0.6, line),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("TOPPADDING", (0, 0), (-1, -1), 7),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-            ("LEFTPADDING", (0, 0), (-1, -1), 9),
-        ]))
-
         rows = [list(COLUMNS)]
         for _, row in with_totals.iterrows():
             rows.append([
                 pdf_text(row["Trans. Date"]), pdf_text(row["Value. Date"]),
                 pdf_text(row["Debits"]), pdf_text(row["Credits"]),
                 pdf_text(row["Balance"]),
-                Paragraph(html.escape(pdf_text(row["Remarks"])), small),
+                Paragraph(html.escape(pdf_text(row["Remarks"])), body),
             ])
         first_total = len(rows) - footer_rows
 
-        # A total row's label ("Uncleared Amount") is wider than one date
-        # column, so it takes both: "Uncleared Amount: 0".
         spans = []
         for index in range(first_total, len(rows)):
             if rows[index][1]:
                 rows[index][0] += f": {rows[index][1]}"
                 rows[index][1] = ""
             spans.append(("SPAN", (0, index), (1, index)))
+
         table = Table(
-            rows, colWidths=[60, 60, 62, 62, 68, 211], repeatRows=1
+            rows, colWidths=[77, 77, 76, 77, 77, 130], repeatRows=1
         )
         table.setStyle(TableStyle([
-            ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 8),
-            ("FONT", (0, 1), (-1, -1), "Helvetica", 8),
-            ("BACKGROUND", (0, 0), (-1, 0), ink),
+            ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 7.6),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("ROWBACKGROUNDS", (0, 1), (-1, first_total - 1),
-             [colors.white, soft]),
-            ("ALIGN", (2, 0), (4, -1), "RIGHT"),
+            ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+            ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 1), (-1, -1), 7.6),
+            ("TEXTCOLOR", (0, 1), (-1, -1), colors.black),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LINEBELOW", (0, 0), (-1, -1), 0.4, line),
-            ("BOX", (0, 0), (-1, -1), 0.6, line),
+            ("ALIGN", (2, 0), (4, -1), "RIGHT"),
+            ("GRID", (0, 0), (-1, -1), 0.4, RULE),
             ("TOPPADDING", (0, 0), (-1, -1), 4),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            # The totals at the end.
-            ("FONT", (0, first_total), (-1, -1), "Helvetica-Bold", 8),
-            ("LINEABOVE", (0, first_total), (-1, first_total), 1, ink),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("FONT", (0, first_total), (-1, -1), "Helvetica-Bold", 7.6),
+            ("LINEABOVE", (0, first_total), (-1, first_total), 0.8, NAVY),
         ] + spans))
 
-        return [summary, Spacer(1, 12), table, Spacer(1, 12),
-                Paragraph(PDF_NOTE, note)]
+        if show_note:
+            return [table, Spacer(1, 8), Paragraph(PDF_NOTE, note)]
+        return [table]
 
     def render(total_pages: int) -> tuple:
         pages = []
 
         def draw_page(canvas, doc):
-            """Header and footer, drawn before the page content."""
             pages.append(doc.page)
             canvas.saveState()
-            canvas.setFillColor(ink)
-            canvas.rect(0, page_height - 10, page_width, 10, stroke=0, fill=1)
-            canvas.setFont("Helvetica-Bold", 24)
-            canvas.drawCentredString(
-                page_width / 2, page_height - 46, pdf_text(PROJECT_HEADER)
-            )
-            canvas.setFillColor(colors.black)
-            canvas.setFont("Helvetica-Bold", 11)
-            canvas.drawCentredString(
-                page_width / 2, page_height - 63,
-                pdf_text(f"Index Number: {INDEX_NUMBER}"),
-            )
-            canvas.setFillColor(colors.HexColor("#B42318"))
-            canvas.setFont("Helvetica-Bold", 9)
-            canvas.drawCentredString(
-                page_width / 2, page_height - 78, PDF_SUBTITLE
-            )
-            canvas.setStrokeColor(line)
-            canvas.setLineWidth(0.8)
-            canvas.line(margin, page_height - 90,
-                        page_width - margin, page_height - 90)
 
-            canvas.line(margin, 38, page_width - margin, 38)
-            canvas.setFillColor(colors.HexColor("#5B6B7C"))
-            canvas.setFont("Helvetica-Bold", 7.5)
-            canvas.drawString(margin, 26, PDF_FOOTER)
-            canvas.setFont("Helvetica", 7.5)
-            canvas.drawRightString(
-                page_width - margin, 26,
-                f"Page {doc.page} of {total_pages}",
+            canvas.setFillColor(NAVY)
+            canvas.rect(0, 0, BAR_W, page_height, stroke=0, fill=1)
+
+            draw_logo(canvas, page_width - MARGIN_R - 30,
+                      page_height - 66, 30)
+
+            canvas.setFillColor(colors.black)
+            canvas.setFont("Helvetica-Bold", 7.8)
+            canvas.drawString(
+                MARGIN_L, page_height - 82,
+                f"Statement Period {start_date.strftime(DATE_FORMAT)} "
+                f"to {end_date.strftime(DATE_FORMAT)}",
             )
+
+            top = page_height - 96
+            canvas.setFillColor(PANEL)
+            canvas.rect(MARGIN_L, top - len(fields) * 15.4, 263,
+                        len(fields) * 15.4, stroke=0, fill=1)
+
+            y = top - 11
+            for field, value in fields:
+                canvas.setFillColor(LABEL_INK)
+                canvas.setFont("Helvetica-Bold", 7.6)
+                canvas.drawString(MARGIN_L + 8, y, pdf_text(field))
+                canvas.setFillColor(VALUE_INK)
+                canvas.setFont("Helvetica", 7.6)
+                canvas.drawString(MARGIN_L + 76, y, pdf_text(value))
+                y -= 15.4
+
+            canvas.setFillColor(colors.black)
+            canvas.setFont("Helvetica-Bold", 12)
+            canvas.drawRightString(page_width - MARGIN_R, page_height - 248,
+                                   "CUSTOMER STATEMENT")
+            canvas.setFont("Helvetica-Bold", 10.5)
+            canvas.drawRightString(page_width - MARGIN_R, page_height - 266,
+                                   pdf_text(customer_name))
+
+            canvas.setFillColor(colors.HexColor("#333333"))
+            canvas.setFont("Helvetica", 7)
+            canvas.drawRightString(page_width - MARGIN_R, 30,
+                                   f"Page {doc.page} of {total_pages}")
             canvas.restoreState()
 
         def draw_watermark(canvas, doc):
-            """Drawn last, across the page content, three times a page."""
+            if not watermark:
+                return
             canvas.saveState()
             canvas.setFillColor(colors.HexColor("#B42318"))
             canvas.setFillAlpha(0.13)
@@ -1280,14 +1292,12 @@ def statement_pdf(
 
         buffer = io.BytesIO()
         document = BaseDocTemplate(
-            buffer, pagesize=A4,
-            title=pdf_text(f"{PROJECT_HEADER} - sample statement entries"),
-            author="Balance Reconciliation Tool",
-            subject=PDF_SUBTITLE,
+            buffer, pagesize=A4, title="CUSTOMER STATEMENT",
+            author="Balance Reconciliation Tool", subject=PDF_SUBTITLE,
         )
         frame = Frame(
-            margin, 46, page_width - 2 * margin,
-            page_height - 46 - header_height,
+            MARGIN_L, 46, page_width - MARGIN_L - MARGIN_R,
+            header_bottom - 46,
             leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0,
         )
         document.addPageTemplates(PageTemplate(
