@@ -620,4 +620,1115 @@ def prepare_known_frame(raw: pd.DataFrame) -> pd.DataFrame:
         credit are left out.
     """
     frame = raw.copy()
-    frame.columns = [str(c).strip().lower()
+    frame.columns = [str(c).strip().lower() for c in frame.columns]
+
+    if "amount" not in frame.columns:
+        debit_column = next(
+            (c for c in KNOWN_DEBIT_COLUMNS if c in frame.columns), None
+        )
+        credit_column = next(
+            (c for c in KNOWN_CREDIT_COLUMNS if c in frame.columns), None
+        )
+        if debit_column is None and credit_column is None:
+            raise ValueError(
+                "The CSV must contain an 'amount' column, or 'Debits' "
+                "and 'Credits' columns."
+            )
+
+        first_column = frame.columns[0]
+        keep, amounts = [], []
+        for position, (label, row) in enumerate(frame.iterrows(), start=1):
+            first_cell = str(row[first_column]).strip().lower()
+            if first_cell.startswith(NON_TRANSACTION_PREFIXES):
+                continue  # footer / summary row
+
+            try:
+                debit = side_cents(row[debit_column]) if debit_column else 0
+                credit = (
+                    side_cents(row[credit_column]) if credit_column else 0
+                )
+            except ValueError:
+                raise ValueError(
+                    f"Row {position} has an invalid debit or credit."
+                )
+
+            if debit == 0 and credit == 0:
+                continue  # nothing moved on this row
+
+            net = credit - debit
+            sign = "-" if net < 0 else ""
+            keep.append(label)
+            amounts.append(f"{sign}{Decimal(abs(net)) / Decimal(100):.2f}")
+
+        frame = frame.loc[keep].reset_index(drop=True)
+        frame["amount"] = amounts
+
+        if frame.empty:
+            raise ValueError("No transactions were found in the CSV.")
+
+    for position, value in enumerate(frame["amount"], start=1):
+        if pd.isna(value) or str(value).strip() == "":
+            raise ValueError(f"Row {position} has no amount.")
+        try:
+            to_cents(value)
+        except ValueError:
+            raise ValueError(
+                f"Row {position} has an invalid amount: {value}"
+            )
+
+    return frame
+
+
+def known_net(frame: pd.DataFrame) -> int:
+    return sum(to_cents(v) for v in frame["amount"])
+
+
+def parse_date(text: str) -> date:
+    """
+    Parse a date. ISO dates (2026-02-10) are read year-month-day; all other
+    formats (14-Feb-2026, 14/02/2026) are read day first.
+    """
+    text = text.strip()
+    if re.match(r"^\d{4}-\d{1,2}-\d{1,2}", text):
+        return pd.to_datetime(text).date()
+    return pd.to_datetime(text, dayfirst=True).date()
+
+
+def known_items_from_frame(frame: pd.DataFrame, default_date: date) -> list:
+    """
+    Turn uploaded rows into statement items. A date column is used when the
+    CSV has one; otherwise rows are placed on `default_date`. A remarks
+    column (remarks/details/description/narration) is used when present.
+    """
+    date_column = next(
+        (c for c in KNOWN_DATE_COLUMNS if c in frame.columns), None
+    )
+    remark_column = next(
+        (c for c in KNOWN_REMARK_COLUMNS if c in frame.columns), None
+    )
+
+    items = []
+    for position, (_, row) in enumerate(frame.iterrows(), start=1):
+        amount = to_cents(row["amount"])
+        if amount == 0:
+            continue  # a zero amount changes nothing
+
+        row_date = default_date
+        if date_column is not None and not pd.isna(row[date_column]) \
+                and str(row[date_column]).strip() != "":
+            try:
+                row_date = parse_date(str(row[date_column]))
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"Row {position} has an invalid date: "
+                    f"{row[date_column]}"
+                )
+
+        remark = KNOWN_DEFAULT_REMARK
+        if remark_column is not None and not pd.isna(row[remark_column]) \
+                and str(row[remark_column]).strip() != "":
+            remark = str(row[remark_column]).strip()
+
+        items.append({
+            "date": row_date,
+            "amount": amount,
+            "remark": remark,
+            "source": "known",
+        })
+
+    return items
+
+
+# ------------------------------ Salary -----------------------------------
+
+def salary_windows(start_date: date, end_date: date) -> list:
+    """
+    For every month of the gap, the days salary can be paid on: the working
+    days (Monday to Friday, deposits are not made on weekends) from the
+    25th to the end of the month that fall inside the gap dates. Months
+    with no such day are left out. Returns one list of dates per month.
+    """
+    windows = []
+    year, month = start_date.year, start_date.month
+    while date(year, month, 1) <= end_date:
+        next_year, next_month = (
+            (year + 1, 1) if month == 12 else (year, month + 1)
+        )
+        month_end = date(next_year, next_month, 1) - timedelta(days=1)
+        window = gap_days(
+            max(date(year, month, SALARY_FIRST_DAY), start_date),
+            min(month_end, end_date),
+        )[1]
+        if window:
+            windows.append(window)
+        year, month = next_year, next_month
+    return windows
+
+
+def salary_items(
+    amount_cents: int, start_date: date, end_date: date, seed: int = 1
+) -> list:
+    """
+    One salary credit of `amount_cents` per month, on a random pay day
+    from that month's window (see salary_windows). The same seed always
+    gives the same pay days. Salary is money coming IN, so it is a credit.
+    """
+    if amount_cents <= 0:
+        return []
+    rng = random.Random(seed + 2)
+    return [
+        {
+            "date": rng.choice(window),
+            "amount": amount_cents,
+            "remark": SALARY_REMARK,
+            "source": "salary",
+        }
+        for window in salary_windows(start_date, end_date)
+    ]
+
+
+# ------------------------- Statement building ----------------------------
+
+SOURCE_ORDER = {"known": 0, "salary": 1, "generated": 2}
+
+
+def sort_items(items: list) -> list:
+    """
+    Sort by date; on the same date known rows come first, then salary,
+    then estimates.
+    """
+    return sorted(
+        items,
+        key=lambda i: (i["date"], SOURCE_ORDER[i["source"]]),
+    )
+
+
+def lowest_balance(opening_cents: int, items: list) -> int:
+    """The lowest running balance, counting the opening balance."""
+    lowest = balance = opening_cents
+    for item in items:
+        balance += item["amount"]
+        lowest = min(lowest, balance)
+    return lowest
+
+
+def finalize_items(
+    opening_cents: int, fixed: list, generated: list, seed: int
+) -> list:
+    """
+    Combine fixed entries (known and salary rows) and estimated entries in
+    date order. The estimated amounts are re-ordered across their dates so
+    the balance stays at or above zero whenever possible (like a real
+    account). Totals and dates do not change, only which amount lands on
+    which date. Fixed entries are never moved or changed, and a weekend
+    date is only ever given an ATM entry.
+    """
+    rng = random.Random(seed + 1)
+    items = [dict(i) for i in sort_items(fixed + generated)]
+
+    pool = [(i["amount"], i["remark"]) for i in items
+            if i["source"] == "generated"]
+    weekend_dates_left = sum(
+        1 for i in items
+        if i["source"] == "generated" and is_weekend(i["date"])
+    )
+
+    balance = opening_cents
+    for item in items:
+        if item["source"] != "generated":
+            balance += item["amount"]
+            continue
+
+        atm = {k for k, (_, r) in enumerate(pool) if allowed_on_weekend(r)}
+        if is_weekend(item["date"]):
+            # Only an ATM entry can go on a weekend.
+            choices = sorted(atm)
+            weekend_dates_left -= 1
+        elif len(atm) > weekend_dates_left:
+            choices = list(range(len(pool)))
+        else:
+            # Save the last ATM entries for the weekend dates still to come.
+            choices = [k for k in range(len(pool)) if k not in atm]
+
+        feasible = [k for k in choices if balance + pool[k][0] >= 0]
+        if feasible:
+            pick = rng.choice(feasible)
+        else:
+            # Nothing fits: take the largest credit (or the smallest debit).
+            pick = max(choices, key=lambda k: pool[k][0])
+
+        amount, remark = pool.pop(pick)
+        item["amount"], item["remark"] = amount, remark
+        balance += amount
+
+    return items
+
+
+def finalize_statement(
+    opening_cents: int,
+    fixed: list,
+    generated: list,
+    start_date: date,
+    end_date: date,
+    seed: int,
+) -> list:
+    """
+    finalize_items, repeated when the balance would drop below zero.
+
+    Fixed rows (known, salary) and the weekend rule limit where entries
+    can go, so estimated debits can land before the money that covers
+    them. When that happens the estimated entries get new random dates
+    (same amounts and remarks, still following the weekend rule) and the
+    statement is built again, keeping the attempt with the highest lowest
+    balance. The same seed always gives the same result.
+    """
+    best = finalize_items(opening_cents, fixed, generated, seed)
+    if not generated:
+        return best
+
+    closing_cents = opening_cents + sum(i["amount"] for i in best)
+    # A negative opening or closing balance cannot be avoided.
+    target = min(0, opening_cents, closing_cents)
+    best_low = lowest_balance(opening_cents, best)
+    every_day, working_days = gap_days(start_date, end_date)
+
+    for attempt in range(1, DATE_RETRIES + 1):
+        if best_low >= target:
+            break
+        rng = random.Random(seed * 1_000_003 + attempt)
+        moved = [
+            dict(item, date=entry_date(
+                rng, item["remark"], every_day, working_days
+            ))
+            for item in generated
+        ]
+        candidate = finalize_items(opening_cents, fixed, moved, seed + attempt)
+        candidate_low = lowest_balance(opening_cents, candidate)
+        if candidate_low > best_low:
+            best, best_low = candidate, candidate_low
+
+    return best
+
+
+def statement_frame(opening_cents: int, items: list) -> pd.DataFrame:
+    """Build the statement table with a running balance."""
+    rows = []
+    balance = opening_cents
+
+    for item in items:
+        amount = item["amount"]
+        balance += amount
+        text_date = item["date"].strftime(DATE_FORMAT)
+        rows.append({
+            "Trans. Date": text_date,
+            "Value. Date": text_date,
+            "Debits": from_cents(-amount) if amount < 0 else "",
+            "Credits": from_cents(amount) if amount > 0 else "",
+            "Balance": from_cents(balance),
+            "Remarks": item["remark"],
+        })
+
+    return pd.DataFrame(rows, columns=COLUMNS)
+
+
+def build_totals(items: list, final_balance_cents: int) -> pd.DataFrame:
+    """Build the TOTAL / Total Transactions / Uncleared Amount footer."""
+    debits = [-i["amount"] for i in items if i["amount"] < 0]
+    credits = [i["amount"] for i in items if i["amount"] > 0]
+
+    blank = {column: "" for column in COLUMNS}
+
+    total_row = dict(blank)
+    total_row.update({
+        "Trans. Date": "TOTAL",
+        "Debits": from_cents(sum(debits)),
+        "Credits": from_cents(sum(credits)),
+        "Balance": from_cents(final_balance_cents),
+    })
+
+    count_row = dict(blank)
+    count_row.update({
+        "Trans. Date": "Total Transactions",
+        "Debits": plural(len(debits), "Debit"),
+        "Credits": plural(len(credits), "Credit"),
+    })
+
+    uncleared_row = dict(blank)
+    uncleared_row.update({
+        "Trans. Date": "Uncleared Amount",
+        "Value. Date": "0",
+    })
+
+    return pd.DataFrame(
+        [total_row, count_row, uncleared_row], columns=COLUMNS
+    )
+
+
+def verify_statement(
+    opening_cents: int,
+    closing_cents: int,
+    missing_net: int,
+    items: list,
+    table: pd.DataFrame,
+    debit_count: int,
+    credit_count: int,
+    start_date: date,
+    end_date: date,
+    salary_cents: int = 0,
+) -> list:
+    """Return a list of (passed, description) accuracy checks."""
+    generated = [i for i in items if i["source"] == "generated"]
+    salary = [i for i in items if i["source"] == "salary"]
+    gen_debits = [-i["amount"] for i in generated if i["amount"] < 0]
+    gen_credits = [i["amount"] for i in generated if i["amount"] > 0]
+
+    checks = []
+
+    # 1. Row-by-row running balance recomputed from the displayed table.
+    balance = opening_cents
+    running_ok = True
+    for _, row in table.iterrows():
+        if row["Debits"] != "":
+            balance -= to_cents(row["Debits"])
+        if row["Credits"] != "":
+            balance += to_cents(row["Credits"])
+        if to_cents(row["Balance"]) != balance:
+            running_ok = False
+            break
+    checks.append((running_ok, "Every running balance in the table is correct"))
+
+    # 2. Final balance equals the closing balance entered.
+    final = to_cents(table["Balance"].iloc[-1]) if len(table) else opening_cents
+    checks.append((
+        final == closing_cents,
+        f"Final balance ({from_cents(final)}) equals the closing balance "
+        f"({from_cents(closing_cents)})",
+    ))
+
+    # 3. Estimated entries add up to the missing amount exactly.
+    generated_net = sum(i["amount"] for i in generated)
+    checks.append((
+        generated_net == missing_net,
+        f"Estimated entries net ({from_cents(generated_net)}) equals the "
+        f"missing amount ({from_cents(missing_net)})",
+    ))
+
+    if missing_net != 0:
+        # 4. Requested counts.
+        checks.append((
+            len(gen_debits) == debit_count
+            and len(gen_credits) == credit_count,
+            f"Estimated entries: {plural(len(gen_debits), 'debit')} and "
+            f"{plural(len(gen_credits), 'credit')} as requested",
+        ))
+
+        # 5. Minimum sizes.
+        checks.append((
+            all(a >= MIN_DEBIT_CENTS for a in gen_debits)
+            and all(a >= MIN_CREDIT_CENTS for a in gen_credits),
+            f"Every estimated debit is at least "
+            f"{from_cents(MIN_DEBIT_CENTS)} and every estimated credit is "
+            f"at least {from_cents(MIN_CREDIT_CENTS)}",
+        ))
+
+        # 6. Estimated dates fall inside the gap.
+        checks.append((
+            all(start_date <= i["date"] <= end_date for i in generated),
+            "Estimated entries are dated inside the gap dates",
+        ))
+
+    # Salary rows: one credit per month, on a pay day, for the amount
+    # entered.
+    if salary:
+        windows = salary_windows(start_date, end_date)
+        checks.append((
+            len(salary) == len(windows)
+            and all(i["date"] in w for i, w in zip(salary, windows))
+            and all(i["amount"] == salary_cents for i in salary)
+            and all(i["remark"] == SALARY_REMARK for i in salary),
+            f"Salary: {plural(len(salary), 'credit')} of "
+            f"{from_cents(salary_cents)}, one each month on a working day "
+            f"from the {SALARY_FIRST_DAY}th to the month end",
+        ))
+
+    # Monthly card charges are always the fixed amount.
+    card_fees = [
+        -i["amount"] for i in generated
+        if i["remark"].startswith(CARD_FEE_REMARK)
+    ]
+    if card_fees:
+        checks.append((
+            all(a == CARD_FEE_CENTS for a in card_fees),
+            f"Every monthly card charge is exactly "
+            f"{from_cents(CARD_FEE_CENTS)}",
+        ))
+
+    # ATM withdrawals never have cents.
+    atm_withdrawals = [
+        -i["amount"] for i in generated
+        if i["amount"] < 0 and allowed_on_weekend(i["remark"])
+    ]
+    if atm_withdrawals:
+        checks.append((
+            all(a % ATM_NOTE_CENTS == 0 for a in atm_withdrawals),
+            f"Every ATM withdrawal is a whole amount with no cents "
+            f"(a multiple of {from_cents(ATM_NOTE_CENTS)})",
+        ))
+
+    # Weekend rule (uploaded rows are left exactly as uploaded).
+    if generated or salary:
+        checks.append((
+            all(
+                allowed_on_weekend(i["remark"]) or not is_weekend(i["date"])
+                for i in generated + salary
+            ),
+            "Only ATM entries fall on a Saturday or Sunday",
+        ))
+
+    # 7. Balance stays at or above zero (not checked with uploaded rows or
+    #    a negative opening or closing balance). It holds whenever the
+    #    estimated entries could be dated to fit around the pay days and
+    #    the weekend rule.
+    if (
+        all(i["source"] != "known" for i in items)
+        and opening_cents >= 0 and closing_cents >= 0
+    ):
+        lowest = lowest_balance(opening_cents, items)
+        hint = "" if lowest >= 0 else " - try another random seed"
+        checks.append((
+            lowest >= 0,
+            f"Balance never drops below zero "
+            f"(lowest: {from_cents(lowest)}){hint}",
+        ))
+
+    # 8. No zero-amount rows.
+    checks.append((
+        all(i["amount"] != 0 for i in items),
+        "No zero-amount rows",
+    ))
+
+    return checks
+
+
+# ------------------------------ PDF export -------------------------------
+
+BRANCH_NAME = "RING ROAD BRANCH"
+ACCOUNT_NO = "1219001246482"
+ADDRESS = "P.O.BOX M43, ACCRA"
+ACCOUNT_TYPE = "SAVINGS ACCOUNT"
+CURRENCY = "GHANA CEDI"
+
+NAVY = colors.HexColor("#16233C")
+PANEL = colors.HexColor("#F5F5F5")
+RULE = colors.HexColor("#D9D9D9")
+LABEL_INK = colors.HexColor("#2B2B2B")
+VALUE_INK = colors.HexColor("#5A5A5A")
+
+MARGIN_L = 40
+MARGIN_R = 40
+BAR_W = 9
+
+FONT = "Helvetica"
+FONT_BOLD = "Helvetica-Bold"
+BODY_SIZE = 7.6
+LEADING = 9.4
+PAD_V = 4
+PAD_H = 5
+
+COLUMN_WIDTHS = [77, 77, 76, 77, 77, 130]
+HEADER_ROW_HEIGHT = 15
+MIN_ROW_HEIGHT = 14
+
+
+def pdf_text(value) -> str:
+    """Text the PDF's built-in font can show; other characters become ?."""
+    text = "" if value is None else str(value)
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def draw_logo(canvas, x, y, size):
+    canvas.saveState()
+    canvas.setFillColor(NAVY)
+    canvas.roundRect(x, y, size, size, 3, stroke=0, fill=1)
+    canvas.setFillColor(colors.white)
+    canvas.setFont(FONT_BOLD, 8.2)
+    canvas.drawCentredString(x + size / 2, y + size - 13, "GTBank")
+    canvas.setFont(FONT, 2.7)
+    canvas.drawCentredString(x + size / 2, y + 5.5, "Guaranty Trust Bank")
+    canvas.restoreState()
+
+
+def wrap_lines(text: str, font: str, size: float, width: float) -> list:
+    """Split text into lines that fit `width`; never returns an empty list."""
+    if not text:
+        return [""]
+    return simpleSplit(text, font, size, max(width, 10)) or [""]
+
+
+def statement_pdf(
+    with_totals: pd.DataFrame,
+    footer_rows: int,
+    opening_cents: int,
+    closing_cents: int,
+    start_date: date,
+    end_date: date,
+    customer_name: str = CUSTOMER_NAME,
+    watermark: bool = False,
+    show_note: bool = False,
+) -> bytes:
+    """
+    The statement table laid out as a GTBank customer statement.
+
+    Rows are measured and paginated here rather than handed to a flowable,
+    so the header block and the column headings are drawn on every page and
+    a row can never ride up over them.
+    """
+    page_width, page_height = A4
+    table_left = MARGIN_L
+    table_right = table_left + sum(COLUMN_WIDTHS)
+    header_bottom = page_height - 312
+    bottom_limit = 46
+
+    fields = [
+        ("Print Date", date.today().strftime(DATE_FORMAT)),
+        ("Branch Name", BRANCH_NAME),
+        ("Account No", ACCOUNT_NO),
+        ("Address", ADDRESS),
+        ("Account Type", ACCOUNT_TYPE),
+        ("Currency", CURRENCY),
+        ("Opening Balance", from_cents(opening_cents)),
+        ("Closing Balance", from_cents(closing_cents)),
+    ]
+
+    entries = len(with_totals) - footer_rows
+
+    # Each row becomes (cells, bold) where a cell is (text, width). Total
+    # rows carry a label that spans the two date columns.
+    rows = []
+    for index, (_, row) in enumerate(with_totals.iterrows()):
+        bold = index >= entries
+        if bold:
+            label = pdf_text(row["Trans. Date"])
+            second = pdf_text(row["Value. Date"])
+            if second:
+                label = f"{label}: {second}"
+            cells = [
+                (label, COLUMN_WIDTHS[0] + COLUMN_WIDTHS[1]),
+                (pdf_text(row["Debits"]), COLUMN_WIDTHS[2]),
+                (pdf_text(row["Credits"]), COLUMN_WIDTHS[3]),
+                (pdf_text(row["Balance"]), COLUMN_WIDTHS[4]),
+                (pdf_text(row["Remarks"]), COLUMN_WIDTHS[5]),
+            ]
+        else:
+            cells = [
+                (pdf_text(row[column]), width)
+                for column, width in zip(COLUMNS, COLUMN_WIDTHS)
+            ]
+        rows.append((cells, bold))
+
+    def measure(cells: list, bold: bool) -> float:
+        font = FONT_BOLD if bold else FONT
+        lines = 1
+        for text, width in cells:
+            lines = max(lines, len(wrap_lines(
+                text, font, BODY_SIZE, width - 2 * PAD_H
+            )))
+        return max(MIN_ROW_HEIGHT, lines * LEADING + 2 * PAD_V)
+
+    # Paginate up front, so the footer can say "Page N of M".
+    pages, current = [], []
+    y = header_bottom - HEADER_ROW_HEIGHT
+    for cells, bold in rows:
+        height = measure(cells, bold)
+        if y - height < bottom_limit:
+            pages.append(current)
+            current, y = [], header_bottom - HEADER_ROW_HEIGHT
+        current.append((cells, bold, height))
+        y -= height
+    pages.append(current)
+
+    def draw_chrome(canvas, page_number: int, total_pages: int):
+        canvas.saveState()
+
+        canvas.setFillColor(NAVY)
+        canvas.rect(0, 0, BAR_W, page_height, stroke=0, fill=1)
+
+        draw_logo(canvas, page_width - MARGIN_R - 30, page_height - 66, 30)
+
+        canvas.setFillColor(colors.black)
+        canvas.setFont(FONT_BOLD, 7.8)
+        canvas.drawString(
+            MARGIN_L, page_height - 82,
+            f"Statement Period {start_date.strftime(DATE_FORMAT)} "
+            f"to {end_date.strftime(DATE_FORMAT)}",
+        )
+
+        top = page_height - 96
+        canvas.setFillColor(PANEL)
+        canvas.rect(MARGIN_L, top - len(fields) * 15.4, 263,
+                    len(fields) * 15.4, stroke=0, fill=1)
+
+        field_y = top - 11
+        for field, value in fields:
+            canvas.setFillColor(LABEL_INK)
+            canvas.setFont(FONT_BOLD, 7.6)
+            canvas.drawString(MARGIN_L + 8, field_y, pdf_text(field))
+            canvas.setFillColor(VALUE_INK)
+            canvas.setFont(FONT, 7.6)
+            canvas.drawString(MARGIN_L + 76, field_y, pdf_text(value))
+            field_y -= 15.4
+
+        canvas.setFillColor(colors.black)
+        canvas.setFont(FONT_BOLD, 12)
+        canvas.drawRightString(page_width - MARGIN_R, page_height - 248,
+                               "CUSTOMER STATEMENT")
+        canvas.setFont(FONT_BOLD, 10.5)
+        canvas.drawRightString(page_width - MARGIN_R, page_height - 266,
+                               pdf_text(customer_name))
+
+        canvas.setFillColor(colors.HexColor("#333333"))
+        canvas.setFont(FONT, 7)
+        canvas.drawRightString(page_width - MARGIN_R, 30,
+                               f"Page {page_number} of {total_pages}")
+        canvas.restoreState()
+
+    def draw_watermark(canvas):
+        canvas.saveState()
+        canvas.setFillColor(colors.HexColor("#B42318"))
+        canvas.setFillAlpha(0.13)
+        canvas.setFont(FONT_BOLD, 34)
+        for centre_y in (page_height * 0.78, page_height * 0.5,
+                         page_height * 0.22):
+            canvas.saveState()
+            canvas.translate(page_width / 2, centre_y)
+            canvas.rotate(28)
+            canvas.drawCentredString(0, 0, PDF_WATERMARK)
+            canvas.restoreState()
+        canvas.restoreState()
+
+    buffer = io.BytesIO()
+    document = pdfcanvas.Canvas(buffer, pagesize=A4)
+    document.setTitle("CUSTOMER STATEMENT")
+    document.setAuthor("Balance Reconciliation Tool")
+    document.setSubject(PDF_SUBTITLE)
+
+    total_pages = len(pages)
+    for page_number, page_rows in enumerate(pages, start=1):
+        draw_chrome(document, page_number, total_pages)
+
+        # Column headings, always at the same place on every page.
+        document.setFillColor(NAVY)
+        document.rect(table_left, header_bottom - HEADER_ROW_HEIGHT,
+                      table_right - table_left, HEADER_ROW_HEIGHT,
+                      stroke=0, fill=1)
+        document.setFillColor(colors.white)
+        document.setFont(FONT_BOLD, BODY_SIZE)
+        heading_x = table_left
+        for title, width in zip(COLUMNS, COLUMN_WIDTHS):
+            document.drawString(heading_x + PAD_H,
+                                header_bottom - HEADER_ROW_HEIGHT + 4, title)
+            heading_x += width
+
+        y = header_bottom - HEADER_ROW_HEIGHT
+        for cells, bold, height in page_rows:
+            font = FONT_BOLD if bold else FONT
+            document.setFont(font, BODY_SIZE)
+            document.setFillColor(colors.black)
+            cell_x = table_left
+            for text, width in cells:
+                line_y = y - PAD_V - BODY_SIZE
+                for line in wrap_lines(text, font, BODY_SIZE,
+                                       width - 2 * PAD_H):
+                    document.drawString(cell_x + PAD_H, line_y, line)
+                    line_y -= LEADING
+                cell_x += width
+
+            document.setStrokeColor(RULE)
+            document.setLineWidth(0.4)
+            document.line(table_left, y, table_right, y)
+            y -= height
+
+        table_bottom = y
+        document.setStrokeColor(RULE)
+        document.setLineWidth(0.4)
+        divider_x = table_left
+        for width in COLUMN_WIDTHS:
+            document.line(divider_x, header_bottom, divider_x, table_bottom)
+            divider_x += width
+        document.line(table_right, header_bottom, table_right, table_bottom)
+        document.line(table_left, table_bottom, table_right, table_bottom)
+
+        if show_note:
+            document.setFont(FONT, 7)
+            document.setFillColor(VALUE_INK)
+            note_y = table_bottom - 14
+            for line in wrap_lines(PDF_NOTE, FONT, 7,
+                                   table_right - table_left):
+                document.drawString(table_left, note_y, line)
+                note_y -= 9.5
+
+        if watermark:
+            draw_watermark(document)
+
+        document.showPage()
+
+    document.save()
+    return buffer.getvalue()
+
+
+def download_button(label: str, data, file_name: str, mime: str) -> None:
+    """
+    A download button. On Streamlit 1.43 and newer a click does not reload
+    the page, so the results stay on screen for the next download.
+    """
+    version = tuple(int(n) for n in st.__version__.split(".")[:2])
+    extra = {"on_click": "ignore"} if version >= (1, 43) else {}
+    st.download_button(
+        label, data=data, file_name=file_name, mime=mime, **extra
+    )
+
+
+def show_table(frame: pd.DataFrame) -> None:
+    """Display a table full width on both old and new Streamlit versions."""
+    try:
+        st.dataframe(frame, width="stretch")
+    except TypeError:
+        st.dataframe(frame, use_container_width=True)
+
+
+# ------------------------------- App -------------------------------------
+
+st.set_page_config(
+    page_title="Balance Reconciliation",
+    layout="wide"
+)
+
+st.markdown(
+    f"**{PROJECT_HEADER}**  \n"
+    f"Index Number: **{INDEX_NUMBER}**"
+)
+
+st.title("Balance Reconciliation Tool")
+
+st.warning(
+    "This tool calculates balance differences and creates estimated "
+    "reconciliation entries. It cannot recover actual merchant names, "
+    "dates, or transaction amounts from balances alone."
+)
+
+mode = st.selectbox(
+    "Operation",
+    [
+        "Reconcile opening and closing balances",
+        "Calculate closing balance",
+        "Calculate opening balance",
+    ]
+)
+
+st.caption(
+    "Amounts use positive numbers for credits/deposits and "
+    "negative numbers for debits/withdrawals."
+)
+
+uploaded_file = st.file_uploader(
+    "Optional known-transactions CSV",
+    type=["csv"],
+    help=(
+        "Needs an 'amount' column, or 'Debits' and 'Credits' columns "
+        "(a downloaded statement_entries.csv works as it is). "
+        "Optional columns: 'date' (any common "
+        "format, e.g. 2026-02-14 or 14-Feb-2026) and 'remarks', 'details', "
+        "'description' or 'narration'. Rows without a date are placed on "
+        "the gap start date."
+    ),
+)
+
+known_frame = pd.DataFrame()
+known_net_cents = 0
+
+if uploaded_file is not None:
+    try:
+        known_frame = prepare_known_frame(read_known_csv(uploaded_file))
+        known_net_cents = known_net(known_frame)
+
+        st.success(
+            f"Known transaction net: "
+            f"{money(known_net_cents)}"
+        )
+        show_table(known_frame)
+
+    except Exception as exc:
+        st.error(f"Could not read the CSV: {exc}")
+        st.stop()
+
+
+if mode == "Calculate closing balance":
+    opening_text = st.text_input("Opening balance", "1000.00")
+
+    if st.button("Calculate closing balance"):
+        try:
+            opening_cents = to_cents(opening_text)
+            closing_cents = opening_cents + known_net_cents
+
+            st.metric(
+                "Calculated closing balance",
+                f"{money(closing_cents)}"
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+elif mode == "Calculate opening balance":
+    closing_text = st.text_input("Closing balance", "1000.00")
+
+    if st.button("Calculate opening balance"):
+        try:
+            closing_cents = to_cents(closing_text)
+            opening_cents = closing_cents - known_net_cents
+
+            st.metric(
+                "Calculated opening balance",
+                f"{money(opening_cents)}"
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+else:
+    # Default gap: the 1st of last month up to today, so the dates always
+    # include working days and at least one salary pay day.
+    today = date.today()
+    first_of_last_month = (
+        today.replace(day=1) - timedelta(days=1)
+    ).replace(day=1)
+
+    left, right = st.columns(2)
+
+    with left:
+        opening_text = st.text_input(
+            "Opening balance",
+            "1000.00"
+        )
+        start_date = st.date_input(
+            "Gap start date",
+            value=first_of_last_month
+        )
+
+    with right:
+        closing_text = st.text_input(
+            "Closing balance",
+            "1250.00"
+        )
+        end_date = st.date_input(
+            "Gap end date",
+            value=today
+        )
+
+    debit_col, credit_col = st.columns(2)
+
+    with debit_col:
+        debit_count = st.number_input(
+            "Number of debits",
+            min_value=0,
+            max_value=100,
+            value=6,
+            step=1,
+        )
+
+    with credit_col:
+        credit_count = st.number_input(
+            "Number of credits",
+            min_value=0,
+            max_value=100,
+            value=2,
+            step=1,
+        )
+
+    salary_text = st.text_input(
+        "Monthly salary (optional)",
+        "0.00",
+        help=(
+            "Added as a credit once a month, on a working day (Monday to "
+            f"Friday) from the {SALARY_FIRST_DAY}th to the end of the "
+            f"month, with the remark '{SALARY_REMARK}'. Salary credits are "
+            "extra to the number of credits above. Leave at 0 for no salary."
+        ),
+    )
+
+    seed = st.number_input(
+        "Random seed",
+        min_value=0,
+        value=1,
+        step=1,
+        help="Use the same seed to reproduce the same result."
+    )
+
+    if st.button("Reconcile balances", type="primary"):
+        try:
+            opening_cents = to_cents(opening_text)
+            closing_cents = to_cents(closing_text)
+
+            if end_date < start_date:
+                raise ValueError("End date cannot be before start date.")
+
+            salary_cents = to_cents(salary_text) if salary_text.strip() else 0
+            if salary_cents < 0:
+                raise ValueError("Monthly salary cannot be negative.")
+
+            salary_entries = salary_items(
+                salary_cents, start_date, end_date, int(seed)
+            )
+            salary_total = sum(i["amount"] for i in salary_entries)
+
+            expected_change = closing_cents - opening_cents
+            missing_net = expected_change - known_net_cents - salary_total
+
+            summary = st.columns(4 if salary_entries else 3)
+
+            summary[0].metric(
+                "Total balance change",
+                f"{money(expected_change)}"
+            )
+            summary[1].metric(
+                "Known transaction net",
+                f"{money(known_net_cents)}"
+            )
+            if salary_entries:
+                summary[2].metric(
+                    f"Salary ({plural(len(salary_entries), 'credit')})",
+                    f"{money(salary_total)}"
+                )
+            summary[-1].metric(
+                "Missing net amount",
+                f"{money(missing_net)}"
+            )
+
+            if salary_cents > 0 and not salary_entries:
+                st.info(
+                    f"No pay day (a working day from the {SALARY_FIRST_DAY}"
+                    "th to the end of a month) falls between the gap "
+                    "dates, so no salary entry was added."
+                )
+
+            known_items = known_items_from_frame(known_frame, start_date) \
+                if len(known_frame) else []
+
+            generated_items = generate_items(
+                net_cents=missing_net,
+                debit_count=int(debit_count),
+                credit_count=int(credit_count),
+                start_date=start_date,
+                end_date=end_date,
+                seed=int(seed),
+            )
+
+            items = finalize_statement(
+                opening_cents, known_items + salary_entries,
+                generated_items, start_date, end_date, int(seed),
+            )
+
+            if not items:
+                st.success(
+                    "The opening and closing balances already match. "
+                    "There is nothing to generate."
+                )
+            else:
+                if missing_net == 0:
+                    st.success(
+                        "The known transactions and salary entries already "
+                        "reconcile the balances, so no estimated entries "
+                        "were added."
+                        if salary_entries else
+                        "The known transactions already reconcile the "
+                        "balances, so no estimated entries were added."
+                    )
+
+                table = statement_frame(opening_cents, items)
+                final_balance = opening_cents + sum(
+                    i["amount"] for i in items
+                )
+                with_totals = pd.concat(
+                    [table, build_totals(items, final_balance)],
+                    ignore_index=True,
+                )
+
+                st.markdown(
+                    f"**{PROJECT_HEADER}** | Index Number: {INDEX_NUMBER}"
+                )
+                st.subheader("Statement entries")
+                show_table(with_totals)
+
+                st.subheader("Accuracy checks")
+                checks = verify_statement(
+                    opening_cents=opening_cents,
+                    closing_cents=closing_cents,
+                    missing_net=missing_net,
+                    items=items,
+                    table=table,
+                    debit_count=int(debit_count),
+                    credit_count=int(credit_count),
+                    start_date=start_date,
+                    end_date=end_date,
+                    salary_cents=salary_cents,
+                )
+                for passed, description in checks:
+                    if passed:
+                        st.success(description)
+                    else:
+                        st.error(f"FAILED: {description}")
+
+                generated_only = [
+                    i for i in items if i["source"] == "generated"
+                ]
+                big_debits = sum(
+                    1 for i in generated_only
+                    if -i["amount"] > BIG_THRESHOLD_CENTS
+                )
+                big_credits = sum(
+                    1 for i in generated_only
+                    if i["amount"] > BIG_THRESHOLD_CENTS
+                )
+                if generated_only:
+                    st.caption(
+                        f"Estimated debits above "
+                        f"{from_cents(BIG_THRESHOLD_CENTS)}: {big_debits}. "
+                        f"Estimated credits above "
+                        f"{from_cents(BIG_THRESHOLD_CENTS)}: {big_credits}."
+                    )
+
+                csv_column, pdf_column = st.columns(2)
+
+                with csv_column:
+                    download_button(
+                        "Download statement entries (CSV)",
+                        data=(
+                            f"{PROJECT_HEADER}\n"
+                            f"Index Number: {INDEX_NUMBER}\n\n"
+                            + with_totals.to_csv(index=False)
+                        ),
+                        file_name="statement_entries.csv",
+                        mime="text/csv",
+                    )
+
+                with pdf_column:
+                    if PDF_AVAILABLE:
+                        download_button(
+                            "Download statement entries (PDF)",
+                            data=statement_pdf(
+                                with_totals,
+                                len(with_totals) - len(table),
+                                opening_cents, closing_cents,
+                                start_date, end_date,
+                            ),
+                            file_name="statement_entries.pdf",
+                            mime="application/pdf",
+                        )
+                    else:
+                        st.info(
+                            "The PDF download needs the 'reportlab' "
+                            "package. Add a line saying reportlab to "
+                            "requirements.txt."
+                        )
+
+        except Exception as exc:
+            st.error(str(exc))
