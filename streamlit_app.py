@@ -621,6 +621,13 @@ def prepare_known_frame(raw: pd.DataFrame) -> pd.DataFrame:
     """
     frame = raw.copy()
     frame.columns = [str(c).strip().lower() for c in frame.columns]
+    frame = frame.loc[:, ~frame.columns.duplicated()]
+
+    # Footer and summary rows are not transactions, in either layout.
+    first_column = frame.columns[0]
+    footer = frame[first_column].astype(str).str.strip().str.lower() \
+        .str.startswith(NON_TRANSACTION_PREFIXES)
+    frame = frame.loc[~footer].reset_index(drop=True)
 
     if "amount" not in frame.columns:
         debit_column = next(
@@ -635,13 +642,8 @@ def prepare_known_frame(raw: pd.DataFrame) -> pd.DataFrame:
                 "and 'Credits' columns."
             )
 
-        first_column = frame.columns[0]
         keep, amounts = [], []
         for position, (label, row) in enumerate(frame.iterrows(), start=1):
-            first_cell = str(row[first_column]).strip().lower()
-            if first_cell.startswith(NON_TRANSACTION_PREFIXES):
-                continue  # footer / summary row
-
             try:
                 debit = side_cents(row[debit_column]) if debit_column else 0
                 credit = (
@@ -1179,15 +1181,20 @@ def statement_pdf(
     """
     The statement table laid out as a GTBank customer statement.
 
-    Rows are measured and paginated here rather than handed to a flowable,
-    so the header block and the column headings are drawn on every page and
-    a row can never ride up over them.
+    Page 1 carries the full header block. Every following page carries a
+    compact repeat of the account line and the column headings, on its own
+    table start position, so a continuation page is never a bare table and
+    rows can never ride up into the header.
     """
     page_width, page_height = A4
     table_left = MARGIN_L
     table_right = table_left + sum(COLUMN_WIDTHS)
-    header_bottom = page_height - 312
     bottom_limit = 46
+
+    # Where the table may start: lower on page 1 because of the header
+    # block, higher on continuation pages, which only repeat the headings.
+    first_top = page_height - 312
+    later_top = page_height - 110
 
     fields = [
         ("Print Date", date.today().strftime(DATE_FORMAT)),
@@ -1237,15 +1244,17 @@ def statement_pdf(
 
     # Paginate up front, so the footer can say "Page N of M".
     pages, current = [], []
-    y = header_bottom - HEADER_ROW_HEIGHT
+    top = first_top
+    y = top - HEADER_ROW_HEIGHT
     for cells, bold in rows:
         height = measure(cells, bold)
-        if y - height < bottom_limit:
-            pages.append(current)
-            current, y = [], header_bottom - HEADER_ROW_HEIGHT
+        if y - height < bottom_limit and current:
+            pages.append((current, top))
+            current, top = [], later_top
+            y = top - HEADER_ROW_HEIGHT
         current.append((cells, bold, height))
         y -= height
-    pages.append(current)
+    pages.append((current, top))
 
     def draw_chrome(canvas, page_number: int, total_pages: int):
         canvas.saveState()
@@ -1253,38 +1262,58 @@ def statement_pdf(
         canvas.setFillColor(NAVY)
         canvas.rect(0, 0, BAR_W, page_height, stroke=0, fill=1)
 
-        draw_logo(canvas, page_width - MARGIN_R - 30, page_height - 66, 30)
+        if page_number == 1:
+            draw_logo(
+                canvas, page_width - MARGIN_R - 30, page_height - 66, 30
+            )
 
-        canvas.setFillColor(colors.black)
-        canvas.setFont(FONT_BOLD, 7.8)
-        canvas.drawString(
-            MARGIN_L, page_height - 82,
-            f"Statement Period {start_date.strftime(DATE_FORMAT)} "
-            f"to {end_date.strftime(DATE_FORMAT)}",
-        )
+            canvas.setFillColor(colors.black)
+            canvas.setFont(FONT_BOLD, 7.8)
+            canvas.drawString(
+                MARGIN_L, page_height - 82,
+                f"Statement Period {start_date.strftime(DATE_FORMAT)} "
+                f"to {end_date.strftime(DATE_FORMAT)}",
+            )
 
-        top = page_height - 96
-        canvas.setFillColor(PANEL)
-        canvas.rect(MARGIN_L, top - len(fields) * 15.4, 263,
-                    len(fields) * 15.4, stroke=0, fill=1)
+            panel_top = page_height - 96
+            canvas.setFillColor(PANEL)
+            canvas.rect(MARGIN_L, panel_top - len(fields) * 15.4, 263,
+                        len(fields) * 15.4, stroke=0, fill=1)
 
-        field_y = top - 11
-        for field, value in fields:
-            canvas.setFillColor(LABEL_INK)
-            canvas.setFont(FONT_BOLD, 7.6)
-            canvas.drawString(MARGIN_L + 8, field_y, pdf_text(field))
+            field_y = panel_top - 11
+            for field, value in fields:
+                canvas.setFillColor(LABEL_INK)
+                canvas.setFont(FONT_BOLD, 7.6)
+                canvas.drawString(MARGIN_L + 8, field_y, pdf_text(field))
+                canvas.setFillColor(VALUE_INK)
+                canvas.setFont(FONT, 7.6)
+                canvas.drawString(MARGIN_L + 76, field_y, pdf_text(value))
+                field_y -= 15.4
+
+            canvas.setFillColor(colors.black)
+            canvas.setFont(FONT_BOLD, 12)
+            canvas.drawRightString(page_width - MARGIN_R,
+                                   page_height - 248,
+                                   "CUSTOMER STATEMENT")
+            canvas.setFont(FONT_BOLD, 10.5)
+            canvas.drawRightString(page_width - MARGIN_R,
+                                   page_height - 266,
+                                   pdf_text(customer_name))
+        else:
+            canvas.setFillColor(colors.black)
+            canvas.setFont(FONT_BOLD, 9)
+            canvas.drawString(MARGIN_L, page_height - 44,
+                              "CUSTOMER STATEMENT - continued")
             canvas.setFillColor(VALUE_INK)
             canvas.setFont(FONT, 7.6)
-            canvas.drawString(MARGIN_L + 76, field_y, pdf_text(value))
-            field_y -= 15.4
-
-        canvas.setFillColor(colors.black)
-        canvas.setFont(FONT_BOLD, 12)
-        canvas.drawRightString(page_width - MARGIN_R, page_height - 248,
-                               "CUSTOMER STATEMENT")
-        canvas.setFont(FONT_BOLD, 10.5)
-        canvas.drawRightString(page_width - MARGIN_R, page_height - 266,
-                               pdf_text(customer_name))
+            canvas.drawString(
+                MARGIN_L, page_height - 58,
+                pdf_text(
+                    f"{customer_name}   |   Account {ACCOUNT_NO}   |   "
+                    f"{start_date.strftime(DATE_FORMAT)} to "
+                    f"{end_date.strftime(DATE_FORMAT)}"
+                ),
+            )
 
         canvas.setFillColor(colors.HexColor("#333333"))
         canvas.setFont(FONT, 7)
@@ -1313,10 +1342,12 @@ def statement_pdf(
     document.setSubject(PDF_SUBTITLE)
 
     total_pages = len(pages)
-    for page_number, page_rows in enumerate(pages, start=1):
+    for page_number, (page_rows, top) in enumerate(pages, start=1):
         draw_chrome(document, page_number, total_pages)
 
-        # Column headings, always at the same place on every page.
+        header_bottom = top
+
+        # Column headings, at this page's own table top.
         document.setFillColor(NAVY)
         document.rect(table_left, header_bottom - HEADER_ROW_HEIGHT,
                       table_right - table_left, HEADER_ROW_HEIGHT,
